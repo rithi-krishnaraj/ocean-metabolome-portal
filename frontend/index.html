@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Interactive world map of marine metabolomics samples from the Petras Lab. Powered by GNPS2 FBMN." />
+  <title>Ocean Metabolome Portal</title>
+
+  <!-- Leaflet 2D map library -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<!-- ── Loading overlay ──────────────────────────────────────────────────── -->
+<div id="loading">
+  <div class="loader-globe"></div>
+  <div class="loader-text" id="loader-msg">Initialising globe…</div>
+</div>
+
+<!-- ── Map container ──────────────────────────────────────────────────── -->
+<div id="globe-wrap" style="position:fixed;inset:0;z-index:0;"></div>
+
+<!-- ── Top navigation bar ────────────────────────────────────────────────── -->
+<header id="topbar">
+  <!-- Brand -->
+  <a class="brand" href="/">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" stroke-width="2" aria-hidden="true">
+      <circle cx="12" cy="12" r="10"/>
+      <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10
+               15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+    </svg>
+    Ocean Metabolome Portal
+  </a>
+
+  <!-- Global stats -->
+  <div id="global-stats" aria-label="Summary statistics">
+    <div class="gstat">
+      <span class="val" id="gstat-samples">—</span>
+      <span class="lbl">Samples</span>
+    </div>
+    <div class="gstat">
+      <span class="val" id="gstat-locations">—</span>
+      <span class="lbl">Locations</span>
+    </div>
+    <div class="gstat">
+      <span class="val" id="gstat-datasets">—</span>
+      <span class="lbl">Datasets</span>
+    </div>
+  </div>
+
+  <!-- Colour mode selector -->
+  <div id="map-mode-wrap">
+    <label for="map-mode">Map mode</label>
+    <select id="map-mode" aria-label="Choose map mode">
+      <option value="metabolite" selected>Metabolites</option>
+      <option value="location">Locations</option>
+    </select>
+  </div>
+
+  <div id="color-mode-wrap">
+    <label for="color-mode">Colour by</label>
+    <select id="color-mode" aria-label="Choose colour coding">
+      <option value="ecosystem">Ecosystem</option>
+      <option value="year">Year</option>
+      <option value="region">Region</option>
+    </select>
+  </div>
+
+  <!-- Admin link -->
+  <a class="btn-icon" href="/admin" title="Manage datasets">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+      <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>
+    </svg>
+    Manage Data
+  </a>
+</header>
+
+<!-- ── Filter panel (left sidebar) ───────────────────────────────────────── -->
+<aside id="filter-panel" aria-label="Sample filters">
+  <div class="panel-header">
+    <span>Filters</span>
+  </div>
+  <div class="filter-scroll">
+
+    <div class="filter-group">
+      <label for="filter-region">Region</label>
+      <select id="filter-region">
+        <option value="">All Regions</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="filter-year">Year</label>
+      <select id="filter-year">
+        <option value="">All Years</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="filter-ecosystem">Ecosystem</label>
+      <select id="filter-ecosystem">
+        <option value="">All Ecosystems</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="filter-depth-bucket">Depth</label>
+      <select id="filter-depth-bucket">
+        <option value="">All Depths</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="filter-dataset">Dataset</label>
+      <select id="filter-dataset">
+        <option value="">All Datasets</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="filter-metadata-key">Metadata Category</label>
+      <select id="filter-metadata-key">
+        <option value="">All Metadata Categories</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="filter-metadata-value">Metadata Value</label>
+      <select id="filter-metadata-value">
+        <option value="">All Values</option>
+      </select>
+    </div>
+
+    <div class="filter-actions">
+      <button class="btn-sm btn-apply" id="apply-filters">Apply</button>
+      <button class="btn-sm btn-reset" id="reset-filters">Reset</button>
+    </div>
+
+  </div>
+
+  <div class="result-count" id="result-count">
+    Loading…
+  </div>
+</aside>
+
+<!-- Panel collapse toggle -->
+<button id="panel-toggle" class="panel-toggle" title="Hide filters" aria-label="Toggle filter panel">
+  ‹
+</button>
+
+<!-- ── Info panel (right, slides in on click) ────────────────────────────── -->
+<aside id="info-panel" aria-label="Sample location details">
+  <div class="info-header">
+    <span class="title" id="info-title">Location Details</span>
+    <button class="close-btn" id="close-info" aria-label="Close details">×</button>
+  </div>
+  <div class="info-scroll">
+    <div class="info-kv" id="info-kv"></div>
+    <hr class="info-divider" />
+    <div id="info-batches"></div>
+    <div id="info-links"></div>
+  </div>
+</aside>
+
+<!-- ── Colour legend (bottom, centred) ───────────────────────────────────── -->
+<div id="legend" aria-label="Colour legend">
+  <div class="leg-header">
+    <span class="leg-title">Legend</span>
+    <button class="leg-toggle" title="Collapse legend" aria-label="Toggle legend">&#9660;</button>
+  </div>
+  <div class="leg-items"></div>
+</div>
+
+<!-- ── Drag hint ─────────────────────────────────────────────────────────── -->
+<div id="drag-hint">Drag to pan · Scroll to zoom · Click a point for details</div>
+
+<!-- ── Tooltip ───────────────────────────────────────────────────────────── -->
+<div id="tooltip" role="tooltip"></div>
+
+<!-- ── App entry point (ES module) ───────────────────────────────────────── -->
+<script type="module" src="js/main.js"></script>
+
+</body>
+</html>
