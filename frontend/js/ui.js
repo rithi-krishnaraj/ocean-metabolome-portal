@@ -32,10 +32,26 @@ export class UIController {
     this._filterOptions = options;
     this._metadataValues = options.metadata_values || {};
 
-    this._fillSelect('filter-region',       options.regions,       'All Regions');
-    this._fillSelect('filter-year',         options.years,         'All Years');
-    this._fillSelect('filter-ecosystem',    options.ecosystems,    'All Ecosystems');
-    this._fillSelect('filter-depth-bucket', options.depth_buckets, 'All Depths');
+    const sharedMeta = new Set(options.metadata_categories || []);
+    const fixedMetaFilters = [
+      { id: 'filter-region', attr: 'ATTRIBUTE_region', placeholder: 'All Regions' },
+      { id: 'filter-year', attr: 'ATTRIBUTE_Year', placeholder: 'All Years' },
+      { id: 'filter-ecosystem', attr: 'ATTRIBUTE_ecosystem', placeholder: 'All Ecosystems' },
+      { id: 'filter-depth-bucket', attr: 'ATTRIBUTE_Depth_bucket', placeholder: 'All Depths' },
+    ];
+    fixedMetaFilters.forEach(({ id, attr, placeholder }) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const group = el.closest('.filter-group');
+      const values = sharedMeta.has(attr) ? (this._metadataValues[attr] || []) : [];
+      this._fillSelect(id, values, placeholder);
+      if (group) {
+        group.style.display = sharedMeta.has(attr) ? '' : 'none';
+      }
+      if (!sharedMeta.has(attr)) {
+        el.value = '';
+      }
+    });
 
     // Dataset filter
     const dsEl = document.getElementById('filter-dataset');
@@ -55,20 +71,28 @@ export class UIController {
     const el = document.getElementById('color-mode');
     if (!el) return;
     const current = el.value;
-    const base = [
-      { value: 'ecosystem', label: 'Ecosystem' },
-      { value: 'year', label: 'Year' },
-      { value: 'region', label: 'Region' },
-    ];
-    const meta = (options?.metadata_categories || []).map(c => ({ value: c, label: c }));
+    const meta = (options?.metadata_categories || []).map(c => ({
+      value: c,
+      label: c.replace(/^ATTRIBUTE_/, ''),
+    }));
     el.innerHTML = '';
-    [...base, ...meta].forEach(item => {
+    meta.forEach(item => {
       const opt = document.createElement('option');
       opt.value = item.value;
       opt.textContent = item.label;
       el.appendChild(opt);
     });
-    el.value = [...base, ...meta].some(i => i.value === current) ? current : 'ecosystem';
+    if (meta.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No shared metadata';
+      el.appendChild(opt);
+      el.value = '';
+      el.disabled = true;
+      return;
+    }
+    el.disabled = false;
+    el.value = meta.some(i => i.value === current) ? current : meta[0].value;
   }
 
   /** Update the topbar global stats. */

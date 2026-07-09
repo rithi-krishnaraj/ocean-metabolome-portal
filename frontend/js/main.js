@@ -6,7 +6,7 @@
 
 import { MapRenderer }  from './map.js';
 import { UIController } from './ui.js';
-import { fetchLocations, fetchMetabolitePoints, fetchStats, fetchFilterOptions } from './api.js';
+import { fetchMetabolitePoints } from './api.js';
 
 async function main() {
   // 1. Instantiate the UI controller (pure DOM, no data yet)
@@ -18,7 +18,7 @@ async function main() {
 
   let currentMode = 'metabolite';
   let currentFilters = {};
-  let currentColorMode = 'ecosystem';
+  let currentColorMode = '';
 
   ui.setLoadingMessage('Initialising map...');
 
@@ -43,23 +43,11 @@ async function main() {
   // 3. Fetch data from the backend
   ui.setLoadingMessage('Loading sample data...');
   try {
-    const [stats, filterOpts, locations] = await Promise.all([
-      fetchStats(),
-      fetchFilterOptions(),
-      fetchMetabolitePoints({ color_by: currentColorMode }),
-    ]);
-
-    ui.updateStats(stats);
-    ui.populateFilters(filterOpts);
-    ui.populateColorModes(filterOpts);
+    const points = await fetchMetabolitePoints();
     map.setMapMode(currentMode);
-    map.updateMetabolites(locations);
+    map.updateMetabolites(points);
     ui.updateLegend(map.getLegend());
-    ui.updateResultCount(
-      locations.length,
-      locations.length,
-      currentMode,
-    );
+    ui.updateResultCount(points.length, points.length, currentMode);
   } catch (err) {
     console.error('Failed to load data from backend:', err);
     ui.setLoadingMessage('Could not connect to backend - showing empty map.');
@@ -86,22 +74,11 @@ async function main() {
   async function reloadMapData() {
     try {
       const query = { ...currentFilters };
-      if (currentMode === 'metabolite') {
-        query.color_by = currentColorMode;
-        const points = await fetchMetabolitePoints(query);
-        map.updateMetabolites(points);
-        ui.updateLegend(map.getLegend());
-        ui.updateResultCount(points.length, points.length, currentMode);
-      } else {
-        const locations = await fetchLocations(query);
-        map.updateData(locations);
-        ui.updateLegend(map.getLegend());
-        ui.updateResultCount(
-          locations.length,
-          locations.reduce((s, l) => s + l.count, 0),
-          currentMode,
-        );
-      }
+      query.color_by = currentColorMode;
+      const points = await fetchMetabolitePoints(query);
+      map.updateMetabolites(points);
+      ui.updateLegend(map.getLegend());
+      ui.updateResultCount(points.length, points.length, currentMode);
       ui.closeInfoPanel();
     } catch (err) {
       console.error('Filter error:', err);
@@ -112,11 +89,7 @@ async function main() {
   function applyColorMode(mode) {
     currentColorMode = mode;
     map.setColorMode(mode);
-    if (currentMode === 'metabolite') {
-      reloadMapData();
-    } else {
-      ui.updateLegend(map.getLegend());
-    }
+    reloadMapData();
   }
 }
 

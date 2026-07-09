@@ -1,5 +1,10 @@
-flask>=3.0.0
-flask-cors>=4.0.0
-pandas>=2.0.0
-requests>=2.31.0
-werkzeug>=3.0.0
+fastapi
+uvicorn[standard]
+pandas
+numpy
+scikit-learn
+pyarrow
+httpx
+python-multipart
+openpyxl
+git+https://github.com/Wang-Bioinformatics-Lab/GNPSDataPackage.git

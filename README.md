@@ -63,7 +63,6 @@ The server starts on **http://localhost:5000**.
 |-----|-------------|
 | `http://localhost:5000/` | Interactive WebGL globe map |
 | `http://localhost:5000/admin` | Dataset management (upload / GNPS2 import) |
-| `http://localhost:5000/api/*` | REST API (JSON) |
 
 ---
 

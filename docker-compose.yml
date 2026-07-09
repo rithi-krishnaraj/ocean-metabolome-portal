@@ -1,0 +1,35 @@
+version: '3'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ocean-backend
+    volumes:
+      - ./backend/datasets:/app/datasets:rw
+    networks:
+      - default
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ocean-frontend
+    networks:
+      - default
+      - nginx-net
+    restart: unless-stopped
+    environment:
+      VIRTUAL_HOST: ocean-metabolome-portal.org
+      VIRTUAL_PORT: 80
+      LETSENCRYPT_HOST: ocean-metabolome-portal.org
+      LETSENCRYPT_EMAIL: mwang87@gmail.com
+
+networks:
+  nginx-net:
+    external:
+      name: nginx-net

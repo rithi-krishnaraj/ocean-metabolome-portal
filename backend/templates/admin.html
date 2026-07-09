@@ -638,8 +638,8 @@
       <!-- Manual upload panel -->
       <div id="manual-panel">
         <form id="manual-form" enctype="multipart/form-data">
-          <label>Dataset name <span style="color:var(--danger)">*</span></label>
-          <input type="text" name="name" placeholder="e.g. Pacific Cruise 2024" maxlength="120" required />
+          <label>Dataset name <span style="color:var(--text-dim);font-weight:400">(optional)</span></label>
+          <input type="text" name="name" placeholder="e.g. Pacific Cruise 2024" maxlength="120" />
 
           <label>Feature Quantification Table <span style="color:var(--danger)">*</span>
             <span style="color:var(--text-dim);font-weight:400"> — .txt / .tsv / .csv</span></label>
@@ -854,6 +854,12 @@
 
       <div class="section-sep">Data Preparation <span style="font-weight:400;font-size:11px;">(optional)</span></div>
 
+      <div class="prep-block" style="margin-bottom:16px;">
+        <label>Dataset name for save</label>
+        <input type="text" id="final-dataset-name" maxlength="120" placeholder="Defaults to Task ID (GNPS) or loaded name" />
+        <p>You can rename the dataset here before saving. If left empty, GNPS imports default to the task ID.</p>
+      </div>
+
       <!-- Blank Removal -->
       <div class="prep-block">
         <label class="cb-label">
@@ -881,6 +887,7 @@
         </label>
         <p>Replaces zero-intensity values with a random value between 1 and the minimum detected intensity (LOD),
           preventing log-transform errors in downstream analysis.</p>
+        <p id="imputation-capacity" style="margin-top:8px;color:var(--accent);font-size:12px;"></p>
       </div>
 
       <!-- Action row -->
@@ -1379,6 +1386,7 @@
     const btn    = document.getElementById('gnps-btn');
     const taskId = document.getElementById('gnps-task-id').value.trim();
     const name   = document.getElementById('gnps-name').value.trim();
+    clearAlert('gnps-alert');
     setLoading(btn, true);
     try {
       const resp = await fetch('/api/stage/gnps', {
@@ -1438,6 +1446,28 @@
     document.getElementById('s-features').textContent  = info.n_features;
     document.getElementById('s-annotation').textContent =
       info.has_annotation ? `Yes (${info.n_annotations})` : 'No';
+
+    const finalNameInput = document.getElementById('final-dataset-name');
+    if (finalNameInput) {
+      finalNameInput.value = info.name || '';
+    }
+
+    const imputationCapacityEl = document.getElementById('imputation-capacity');
+    if (imputationCapacityEl) {
+      const stats = info.imputation_stats || {};
+      if (!info.has_ft || !stats.total_values) {
+        imputationCapacityEl.textContent = 'Imputation capacity: unavailable (feature table not loaded).';
+      } else if (stats.imputation_possible) {
+        imputationCapacityEl.textContent =
+          `Imputation capacity: ${stats.imputable_percent}% ` +
+          `(${stats.imputable_values}/${stats.total_values} values).`;
+      } else {
+        imputationCapacityEl.textContent =
+          `Imputation capacity: ${stats.imputable_percent}% ` +
+          `(${stats.imputable_values}/${stats.total_values} values). ` +
+          'Current data does not meet the LOD>1 rule for replacement.';
+      }
+    }
 
     // ── Metadata validation messages ───────────────────────────────────
     const valContainer = document.getElementById('md-validation-container');
@@ -1515,6 +1545,10 @@
     document.getElementById('blank-removal-opts').style.display = 'none';
     document.getElementById('enable-imputation').checked = false;
     document.getElementById('blank-values-wrap').innerHTML = '';
+    const imputationCapacityEl = document.getElementById('imputation-capacity');
+    if (imputationCapacityEl) imputationCapacityEl.textContent = '';
+    const finalNameInput = document.getElementById('final-dataset-name');
+    if (finalNameInput) finalNameInput.value = '';
     // Clear panel-level warnings + continue buttons
     ['manual-staging-warnings', 'gnps-staging-warnings'].forEach(id => renderWarnings(id, []));
     ['manual-continue-btn', 'gnps-continue-btn'].forEach(id => {
@@ -1572,6 +1606,8 @@
       : null;
     const blankCutoff = parseFloat(document.getElementById('blank-cutoff').value) || 0.3;
     const impute      = document.getElementById('enable-imputation').checked;
+    const finalDatasetNameInput = document.getElementById('final-dataset-name');
+    const finalDatasetName = (finalDatasetNameInput?.value || '').trim();
 
     // Annotation merge remains enabled in backend when an annotation table is present.
     const enableMerge = !!(_stageInfo?.has_annotation);
@@ -1585,7 +1621,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           stage_id:        _stageInfo.stage_id,
-          name:            _stageInfo.name,
+          name:            finalDatasetName || _stageInfo.name,
           blank_attribute: enableBlank ? blankAttr || null : null,
           blank_values:    blankVals,
           blank_cutoff:    blankCutoff,

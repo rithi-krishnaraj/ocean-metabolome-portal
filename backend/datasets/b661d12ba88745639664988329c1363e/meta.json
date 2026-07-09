@@ -1,0 +1,25 @@
+{
+  "name": "b661d12ba88745639664988329c1363e",
+  "safe_name": "b661d12ba88745639664988329c1363e",
+  "has_coords": true,
+  "lat_col": "ATTRIBUTE_Latitude",
+  "lon_col": "ATTRIBUTE_Longitude",
+  "n_samples": 186,
+  "n_features": 11217,
+  "has_annotation": true,
+  "md_columns": [
+    "ATTRIBUTE_Sample_Type",
+    "ATTRIBUTE_Batch",
+    "ATTRIBUTE_Month",
+    "ATTRIBUTE_Year",
+    "ATTRIBUTE_Sample_Location",
+    "ATTRIBUTE_Replicate",
+    "ATTRIBUTE_Spot",
+    "ATTRIBUTE_Latitude",
+    "ATTRIBUTE_Longitude",
+    "ATTRIBUTE_Sample_Area",
+    "ATTRIBUTE_Spot_Name",
+    "ATTRIBUTE_time_run",
+    "ATTRIBUTE_Injection_order"
+  ]
+}

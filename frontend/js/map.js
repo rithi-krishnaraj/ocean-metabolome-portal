@@ -73,10 +73,6 @@ export class MapRenderer {
   /** Return entries for the legend panel. */
   getLegend() {
     if (this._mapMode === 'metabolite') {
-      if (this._colorMode === 'year') {
-        const years = [...new Set(this._metabolites.map(p => Number(p.year)))].filter(y => !isNaN(y)).sort((a, b) => a - b);
-        return years.map(y => ({ label: String(y), color: this._yearColor(y) }));
-      }
       const values = [...new Set(this._metabolites.map(p => p.color_value || 'Unknown'))]
         .filter(Boolean)
         .slice(0, 40)
@@ -89,28 +85,16 @@ export class MapRenderer {
       }));
     }
 
-    if (this._colorMode === 'ecosystem') {
-      const seen = new Set(this._locations.flatMap(l => l.ecosystems || []));
-      return [...seen].filter(Boolean).sort().map(eco => ({
-        label: eco,
-        color: ECO_COLORS[eco] || ECO_COLORS['default'],
-      }));
-    }
-    if (this._colorMode === 'year') {
-      // All actual years present in the current data, sorted ascending
-      const years = [...new Set(
-        this._locations.flatMap(l => l.years || [])
-      )].filter(Boolean).map(Number).filter(y => !isNaN(y)).sort((a, b) => a - b);
-      return years.map(y => ({ label: String(y), color: this._yearColor(y) }));
-    }
-    if (this._colorMode === 'region') {
-      const seen = new Set(this._locations.flatMap(l => l.regions || []));
-      return [...seen].filter(Boolean).sort().map(r => ({
-        label: r,
-        color: this._strToHue(r),
-      }));
-    }
-    return [];
+    const values = [...new Set(this._locations.map(l => l.color_value || 'Unknown'))]
+      .filter(Boolean)
+      .slice(0, 40)
+      .sort((a, b) => a.localeCompare(b));
+    return values.map(v => ({
+      label: v,
+      color: this._colorMode === 'ATTRIBUTE_ecosystem'
+        ? (ECO_COLORS[v] || ECO_COLORS['default'])
+        : this._strToHue(v),
+    }));
   }
 
   // ── Internal ──────────────────────────────────────────────────────────────
@@ -223,17 +207,12 @@ export class MapRenderer {
 
     if (!this._metabolites.length) return;
 
-    const intensities = this._metabolites
-      .map(p => Number(p.intensity))
-      .filter(v => !isNaN(v) && v > 0);
-    const minI = intensities.length ? Math.min(...intensities) : 1;
-    const maxI = intensities.length ? Math.max(...intensities) : 1;
-    const span = Math.max(1e-9, Math.log10(maxI + 1) - Math.log10(minI + 1));
-
     this._metabolites.forEach(point => {
-      const intensity = Number(point.intensity) || 0;
-      const t = (Math.log10(intensity + 1) - Math.log10(minI + 1)) / span;
-      const radius = 3 + Math.max(0, Math.min(1, t)) * 9;
+      const intensityFraction = Number(point.intensity_fraction);
+      const radiusScale = Number.isFinite(intensityFraction)
+        ? Math.max(0, Math.min(1, intensityFraction))
+        : 0;
+      const radius = 3 + radiusScale * 9;
       const color = this._getColor(point);
 
       const marker = L.circleMarker([point.lat, point.lon], {
@@ -280,14 +259,11 @@ export class MapRenderer {
       return this._strToHue(val);
     }
 
-    if (this._colorMode === 'year') {
-      return this._yearColor(parseInt(loc.years?.[0]) || YEAR_MIN);
+    const cv = loc.color_value || '';
+    if (this._colorMode === 'ATTRIBUTE_ecosystem') {
+      return ECO_COLORS[cv] || ECO_COLORS['default'];
     }
-    if (this._colorMode === 'region') {
-      return this._strToHue(loc.regions?.[0] || '');
-    }
-    const eco = loc.ecosystems?.[0] || 'default';
-    return ECO_COLORS[eco] || ECO_COLORS['default'];
+    return this._strToHue(cv);
   }
 
   _yearColor(year) {
