@@ -19,6 +19,8 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: ocean-frontend
+    ports:
+      - "8009:80"
     networks:
       - default
       - nginx-net
