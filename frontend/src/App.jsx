@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router
 import { Globe, Settings, RotateCcw } from 'lucide-react'
 import AdminPage from './pages/AdminPage'
 import MapPage from './pages/MapPage'
+import AdminAuthWrapper from './components/AdminAuthWrapper'; // Import the new component
 
 export default function App() {
   return (
@@ -96,7 +97,7 @@ function AppShell() {
               />
             }
           />
-          <Route path="/admin" element={<AdminPage />} />
+          <Route path="/admin" element={<AdminAuthWrapper />} /> {/* Use the wrapper here */}
         </Routes>
       </div>
     </div>

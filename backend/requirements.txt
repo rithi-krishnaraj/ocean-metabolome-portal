@@ -7,4 +7,5 @@ pyarrow
 httpx
 python-multipart
 openpyxl
+passlib
 git+https://github.com/Wang-Bioinformatics-Lab/GNPSDataPackage.git

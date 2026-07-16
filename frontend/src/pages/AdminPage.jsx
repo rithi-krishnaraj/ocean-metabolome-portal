@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import { FileDrop, MetadataUploader } from '../components/FileUploader'
 import DataTable from '../components/DataTable'
-import DataCleanup from '../components/DataCleanup'
+
 import {
   uploadManual,
   uploadGnps,
@@ -23,7 +23,7 @@ import {
   Database,
 } from 'lucide-react'
 
-const STEPS = ['Load Data', 'Preview Tables', 'Data Cleanup', 'Save Dataset']
+const STEPS = ['Load Data', 'Preview Tables', 'Save Dataset']
 
 export default function AdminPage() {
   const [step, setStep] = useState(0)
@@ -44,10 +44,7 @@ export default function AdminPage() {
   const [mdColumnsInfo, setMdColumnsInfo] = useState([])
 
   // Cleanup config
-  const [cleanupState, setCleanupState] = useState({
-    blankRemovalApplied: false,
-    imputeEnabled: false,
-  })
+
 
   // Name
   const [datasetName, setDatasetName] = useState('')
@@ -151,7 +148,6 @@ export default function AdminPage() {
       await saveDataset({
         session_id: session.session_id,
         name: datasetName.trim(),
-        impute: cleanupState.imputeEnabled,
       })
       setSuccessMsg(`Dataset "${datasetName}" saved successfully!`)
       setSession(null)
@@ -400,35 +396,14 @@ export default function AdminPage() {
 
             <div className="flex gap-3">
               <button onClick={() => setStep(2)} className="px-5 py-2 bg-ocean-600 hover:bg-ocean-500 text-white text-sm rounded-lg font-medium">
-                Next: Data Cleanup →
-              </button>
-              <button onClick={() => setStep(3)} className="px-5 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm rounded-lg">
-                Skip to Save
+                Next: Save Dataset →
               </button>
             </div>
           </div>
         )}
 
-        {/* ── STEP 2: Cleanup ──────────────────────────────────────────── */}
+        {/* ── STEP 2: Save ─────────────────────────────────────────────── */}
         {step === 2 && session && (
-          <div className="space-y-4">
-            <h2 className="text-lg font-bold text-slate-100">Data Cleanup</h2>
-            <DataCleanup
-              sessionId={session.session_id}
-              mdColumnsInfo={mdColumnsInfo}
-              onUpdate={setCleanupState}
-            />
-            <button
-              onClick={() => setStep(3)}
-              className="px-5 py-2 bg-ocean-600 hover:bg-ocean-500 text-white text-sm rounded-lg font-medium"
-            >
-              Next: Save Dataset →
-            </button>
-          </div>
-        )}
-
-        {/* ── STEP 3: Save ─────────────────────────────────────────────── */}
-        {step === 3 && session && (
           <div className="space-y-6">
             <h2 className="text-lg font-bold text-slate-100">Save Dataset</h2>
 
@@ -447,12 +422,6 @@ export default function AdminPage() {
               <div className="space-y-1 text-sm text-slate-400 border-t border-slate-700 pt-3">
                 <p>Summary:</p>
                 <ul className="space-y-0.5 text-xs">
-                  <li className={cleanupState.blankRemovalApplied ? 'text-green-400' : 'text-slate-500'}>
-                    {cleanupState.blankRemovalApplied ? '✓' : '○'} Blank removal
-                  </li>
-                  <li className={cleanupState.imputeEnabled ? 'text-green-400' : 'text-slate-500'}>
-                    {cleanupState.imputeEnabled ? '✓' : '○'} Missing value imputation
-                  </li>
                   <li className={session.has_coords ? 'text-green-400' : 'text-yellow-400'}>
                     {session.has_coords ? '✓ Has coordinates (will appear on map)' : '⚠ No coordinates (map display disabled)'}
                   </li>

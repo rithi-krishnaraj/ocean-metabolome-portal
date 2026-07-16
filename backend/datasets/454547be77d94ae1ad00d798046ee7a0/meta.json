@@ -1,0 +1,28 @@
+{
+  "name": "454547be77d94ae1ad00d798046ee7a0",
+  "safe_name": "454547be77d94ae1ad00d798046ee7a0",
+  "source_task_id": "454547be77d94ae1ad00d798046ee7a0",
+  "has_coords": true,
+  "lat_col": "ATTRIBUTE_Latitude",
+  "lon_col": "ATTRIBUTE_Longitude",
+  "n_samples": 2439,
+  "n_features": 15987,
+  "has_annotation": true,
+  "md_columns": [
+    "Owner",
+    "Submitter",
+    "Sample Collector",
+    "MassIVE ID",
+    "ATTRIBUTE_type",
+    "ATTRIBUTE_descriptor",
+    "ATTRIBUTE_ecosystem",
+    "ATTRIBUTE_Year",
+    "ATTRIBUTE_Latitude",
+    "ATTRIBUTE_Longitude",
+    "ATTRIBUTE_Depth",
+    "ATTRIBUTE_Volume",
+    "ATTRIBUTE_SPEcartridge",
+    "ATTRIBUTE_Filtration",
+    "Unnamed: 15"
+  ]
+}

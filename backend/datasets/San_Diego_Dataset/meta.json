@@ -1,6 +1,7 @@
 {
-  "name": "b661d12ba88745639664988329c1363e",
-  "safe_name": "b661d12ba88745639664988329c1363e",
+  "name": "San Diego Dataset",
+  "safe_name": "San_Diego_Dataset",
+  "source_task_id": "b661d12ba88745639664988329c1363e",
   "has_coords": true,
   "lat_col": "ATTRIBUTE_Latitude",
   "lon_col": "ATTRIBUTE_Longitude",
