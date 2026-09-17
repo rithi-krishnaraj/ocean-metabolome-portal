@@ -4,8 +4,22 @@ import { ScatterplotLayer } from '@deck.gl/layers'
 import MapLibreMap from 'react-map-gl/maplibre'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import StatsPanel from '../components/StatsPanel'
-import { getMapData, getMapSampleDetails, getMetaboliteFeatureMatches, getDatasetMetadataSchema, runMapPcoa } from '../api'
-import { Filter, X, RefreshCw, AlertTriangle, BarChart3, Grid, Layers, Sliders, Flame } from 'lucide-react'
+import Plot from 'react-plotly.js'
+import { 
+  getMapData, 
+  getMapSampleDetails, 
+  getMetaboliteFeatureMatches, 
+  getDatasetMetadataSchema, 
+  runMapPcoa,
+  getDatasetMetabolites,
+  getBoxplotData,
+  getVanKrevelenData,
+  getCarbonOxStateData,
+  getFormulaCoverage,
+  runDatasetAnnotation,
+  getUnannotatedCount
+} from '../api'
+import { Filter, X, RefreshCw, AlertTriangle, BarChart3, Grid, Layers, Sliders, Flame, ChevronDown, ChevronRight } from 'lucide-react'
 
 // Free CARTO dark basemap â€” no API key required
 const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
@@ -30,6 +44,68 @@ function strColor(str) {
     return Math.round((l - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)))) * 255)
   }
   return [f(0), f(8), f(4)]
+}
+
+// Sequential cool→warm ramp for intensity; returns [r, g, b] for t in [0, 1].
+function intensityRamp(t) {
+  const clamped = Math.max(0, Math.min(1, t))
+  // Cool blue (#3b82f6) → cyan → yellow → warm red (#ef4444)
+  const stops = [
+    [0.0, [59, 130, 246]],
+    [0.35, [34, 211, 238]],
+    [0.65, [250, 204, 21]],
+    [1.0, [239, 68, 68]],
+  ]
+  let lower = stops[0]
+  let upper = stops[stops.length - 1]
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (clamped >= stops[i][0] && clamped <= stops[i + 1][0]) {
+      lower = stops[i]
+      upper = stops[i + 1]
+      break
+    }
+  }
+  const range = upper[0] - lower[0]
+  if (range === 0) return lower[1]
+  const localT = (clamped - lower[0]) / range
+  return lower[1].map((c, i) => Math.round(c + (upper[1][i] - c) * localT))
+}
+
+function getIntensityScaleValue(intensity, scale) {
+  const num = Number(intensity)
+  if (!Number.isFinite(num) || num < 0) return null
+  if (num === 0) return 'zero'
+  if (scale === 'log') return Math.log10(num)
+  return num
+}
+
+function getPointSampleKey(p, datasetSafeMap) {
+  const sampleId = String(p._sample_id || p.index || p.filename || '').trim()
+  const datasetSafe = String(
+    p._dataset_safe
+    || datasetSafeMap?.[String(p._dataset ?? '')]
+    || ''
+  ).trim()
+  if (!datasetSafe || !sampleId) return null
+  return `${datasetSafe}::${sampleId}`
+}
+
+function describeActiveSampleFilters(filters, selectedSamples, sampleSearch) {
+  const parts = []
+  for (const [col, values] of Object.entries(filters)) {
+    if (!values || values.size === 0) continue
+    const label = col === '_dataset' ? 'Dataset' : col
+    const joined = [...values].slice(0, 3).join(', ')
+    const more = values.size > 3 ? ` +${values.size - 3} more` : ''
+    parts.push(`${label}: ${joined}${more}`)
+  }
+  if (selectedSamples.size > 0) {
+    parts.push(`Samples: ${selectedSamples.size} selected`)
+  }
+  if (sampleSearch.trim()) {
+    parts.push(`Search: "${sampleSearch.trim()}"`)
+  }
+  return parts.length ? parts.join('; ') : 'none'
 }
 
 export default function MapPage({
@@ -68,7 +144,9 @@ export default function MapPage({
   const [metaboliteMatchesLoading, setMetaboliteMatchesLoading] = useState(false)
   const [metaboliteMatchesError, setMetaboliteMatchesError] = useState('')
   const [selectedFeature, setSelectedFeature] = useState(null)
+  const [mapFeature, setMapFeature] = useState(null)
   const [metaboliteSampleKeys, setMetaboliteSampleKeys] = useState(new Set())
+  const [intensityScale, setIntensityScale] = useState('log')
   const metaboliteSearchTimerRef = useRef(null)
 
   // Filters
@@ -76,6 +154,7 @@ export default function MapPage({
   const [sampleSearch, setSampleSearch] = useState('')
   const [selectedSamples, setSelectedSamples] = useState(new Set())
   const [filterOpen, setFilterOpen] = useState(false)
+  const [collapsedSections, setCollapsedSections] = useState({})
   const [legendPos, setLegendPos] = useState({ left: 16, bottom: 16, top: 'auto', transform: 'none' })
   const [legendDragging, setLegendDragging] = useState(false)
   const legendRef = useRef(null)
@@ -110,12 +189,44 @@ export default function MapPage({
   const [pcoaAllSamples, setPcoaAllSamples] = useState([])
   const [expandedGroups, setExpandedGroups] = useState({})
   const [sampleGroupSearch, setSampleGroupSearch] = useState({})
-  const [pcoaZoom, setPcoaZoom] = useState(1)
-  const [pcoaPan, setPcoaPan] = useState({ x: 0, y: 0 })
-  const [pcoaDragStart, setPcoaDragStart] = useState(null)
 
-  // Heatmap State
-  const [heatmapOpen, setHeatmapOpen] = useState(false)
+  // Boxplot State
+  const [boxplotDatasetSafe, setBoxplotDatasetSafe] = useState('')
+  const [boxplotMetabolite, setBoxplotMetabolite] = useState('')
+  const [boxplotSamples, setBoxplotSamples] = useState([])
+  const [boxplotGroupBy, setBoxplotGroupBy] = useState('')
+  const [boxplotMetadataColumns, setBoxplotMetadataColumns] = useState([])
+  const [boxplotAllMetabolites, setBoxplotAllMetabolites] = useState([])
+  const [boxplotAllSamples, setBoxplotAllSamples] = useState([])
+  const [boxplotResult, setBoxplotResult] = useState(null)
+  const [boxplotLoading, setBoxplotLoading] = useState(false)
+  const [boxplotError, setBoxplotError] = useState('')
+  const [boxplotSearch, setBoxplotSearch] = useState('')
+  const [boxplotSampleSearch, setBoxplotSampleSearch] = useState('')
+  const [boxplotExpandedGroups, setBoxplotExpandedGroups] = useState({})
+
+  // Van Krevelen State
+  const [vankrevelenDatasetSafe, setVankrevelenDatasetSafe] = useState('')
+  const [vankrevelenColorBy, setVankrevelenColorBy] = useState('superclass')
+  const [vankrevelenFilterBy, setVankrevelenFilterBy] = useState('superclass')
+  const [vankrevelenResult, setVankrevelenResult] = useState(null)
+  const [vankrevelenLoading, setVankrevelenLoading] = useState(false)
+  const [vankrevelenError, setVankrevelenError] = useState('')
+  const [vankrevelenSearch, setVankrevelenSearch] = useState('')
+  const [vankrevelenSelectedCategories, setVankrevelenSelectedCategories] = useState([])
+  const [vankrevelenAllCategories, setVankrevelenAllCategories] = useState([])
+  const [vankrevelenShowMsbuddy, setVankrevelenShowMsbuddy] = useState(false)
+
+  // Carbon Oxidation State Plot states
+  const [carbonOxStateDatasetSafe, setCarbonOxStateDatasetSafe] = useState('')
+  const [carbonOxStateColorBy, setCarbonOxStateColorBy] = useState('superclass')
+  const [carbonOxStateFilterBy, setCarbonOxStateFilterBy] = useState('superclass')
+  const [carbonOxStateResult, setCarbonOxStateResult] = useState(null)
+  const [carbonOxStateLoading, setCarbonOxStateLoading] = useState(false)
+  const [carbonOxStateError, setCarbonOxStateError] = useState('')
+  const [carbonOxStateSearch, setCarbonOxStateSearch] = useState('')
+  const [carbonOxStateSelectedCategories, setCarbonOxStateSelectedCategories] = useState([])
+  const [carbonOxStateAllCategories, setCarbonOxStateAllCategories] = useState([])
 
   const pcoaSamplesByGroup = useMemo(() => {
     if (!pcoaAllSamples || !pcoaAttribute) return {}
@@ -185,6 +296,8 @@ export default function MapPage({
         categories: pcoaCategories.length > 0 ? pcoaCategories : undefined,
         samples: pcoaSamples.length > 0 ? pcoaSamples : undefined,
         color_by: pcoaColorBy || undefined,
+        x_axis: pcoaXAxis,
+        y_axis: pcoaYAxis,
       })
       if (data.error) {
         setPcoaError(data.error)
@@ -217,14 +330,19 @@ export default function MapPage({
     try {
       const data = await getDatasetMetadataSchema(pcoaDatasetSafe)
       if (data?.categories?.[newAttr]) {
-        setPcoaAllCategories(data.categories[newAttr])
-        setPcoaCategories(data.categories[newAttr])
+        const allCats = data.categories[newAttr]
+        setPcoaAllCategories(allCats)
+        setPcoaCategories(allCats) // Select all categories by default
         
         const samples = data.samples || []
         setPcoaAllSamples(samples)
+        // Select all samples initially
         setPcoaSamples(samples.map(s => s.sample_id))
       } else {
         setPcoaAllCategories([])
+        setPcoaCategories([])
+        setPcoaAllSamples([])
+        setPcoaSamples([])
       }
     } catch (err) {
       console.error(err)
@@ -283,6 +401,150 @@ export default function MapPage({
 
   // Expose a way to bust the cache when needed (e.g. after backend restart)
   const bustCache = () => { hoverDetailsCacheRef.current.clear() }
+
+  // Boxplot Logic
+  useEffect(() => {
+    if (boxplotDatasetSafe) {
+      const loadOptions = async () => {
+        setBoxplotLoading(true)
+        setBoxplotError('')
+        try {
+          const [metas, schema] = await Promise.all([
+            getDatasetMetabolites(boxplotDatasetSafe),
+            getDatasetMetadataSchema(boxplotDatasetSafe)
+          ])
+          setBoxplotAllMetabolites(metas.metabolites || [])
+          const samples = schema.samples || []
+          setBoxplotAllSamples(samples)
+          setBoxplotMetadataColumns(schema.columns || [])
+          setBoxplotSamples(samples.map(s => s.sample_id)) // Select all by default
+          setBoxplotGroupBy(schema.columns?.[0] || '') // Select first column by default
+        } catch (err) {
+          setBoxplotError(err.message || 'Failed to load dataset options')
+        } finally {
+          setBoxplotLoading(false)
+        }
+      }
+      loadOptions()
+    }
+  }, [boxplotDatasetSafe])
+
+  const runBoxplotAnalysis = async () => {
+    if (!boxplotDatasetSafe || !boxplotMetabolite || boxplotSamples.length === 0) {
+      setBoxplotError('Please select a dataset, metabolite, and at least one sample.')
+      return
+    }
+    setBoxplotLoading(true)
+    setBoxplotError('')
+    try {
+      const data = await getBoxplotData(boxplotDatasetSafe, boxplotMetabolite, boxplotSamples)
+      setBoxplotResult(data)
+    } catch (err) {
+      setBoxplotError(err.message || 'Failed to fetch boxplot data')
+      setBoxplotResult(null)
+    } finally {
+      setBoxplotLoading(false)
+    }
+  }
+
+  const toggleBoxplotSample = (sid) => {
+    setBoxplotSamples(prev => {
+      const s = new Set(prev)
+      if (s.has(sid)) s.delete(sid)
+      else s.add(sid)
+      return Array.from(s)
+    })
+  }
+
+  // Clear boxplot results when filters change
+  useEffect(() => {
+    setBoxplotResult(null)
+    setBoxplotError('')
+  }, [boxplotDatasetSafe, boxplotMetabolite, boxplotSamples, boxplotGroupBy])
+
+  // Van Krevelen Defaults & Data Fetching
+  useEffect(() => {
+    if (mapData?.datasets_details?.length > 0 && !vankrevelenDatasetSafe) {
+      setVankrevelenDatasetSafe(mapData.datasets_details[0].safe_name)
+    }
+  }, [mapData, vankrevelenDatasetSafe])
+
+  const runVanKrevelenAnalysis = useCallback(async () => {
+    if (!vankrevelenDatasetSafe) return
+    setVankrevelenLoading(true)
+    setVankrevelenError('')
+    try {
+      const data = await getVanKrevelenData(vankrevelenDatasetSafe, vankrevelenShowMsbuddy)
+      setVankrevelenResult(data)
+    } catch (err) {
+      setVankrevelenError(err.message || 'Failed to fetch Van Krevelen data.')
+      setVankrevelenResult(null)
+    } finally {
+      setVankrevelenLoading(false)
+    }
+  }, [vankrevelenDatasetSafe, vankrevelenShowMsbuddy])
+
+  // Clear stale result when dataset changes
+  useEffect(() => {
+    setVankrevelenResult(null)
+    setVankrevelenAllCategories([])
+    setVankrevelenSelectedCategories([])
+  }, [vankrevelenDatasetSafe])
+
+  useEffect(() => {
+    if (!vankrevelenResult) return
+    const pts = vankrevelenResult.points || []
+    const key = vankrevelenFilterBy || 'superclass'
+    const cats = Array.from(new Set(pts.map(p => String(p[key] || 'Unclassified')))).sort()
+    setVankrevelenAllCategories(cats)
+    setVankrevelenSelectedCategories(cats)
+  }, [vankrevelenResult, vankrevelenFilterBy])
+
+  const toggleVanKrevelenCategory = (cat) => {
+    setVankrevelenSelectedCategories(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat])
+  }
+
+  // Carbon Ox State Defaults & Data Fetching
+  useEffect(() => {
+    if (mapData?.datasets_details?.length > 0 && !carbonOxStateDatasetSafe) {
+      setCarbonOxStateDatasetSafe(mapData.datasets_details[0].safe_name)
+    }
+  }, [mapData, carbonOxStateDatasetSafe])
+
+  const runCarbonOxStateAnalysis = useCallback(async () => {
+    if (!carbonOxStateDatasetSafe) return
+    setCarbonOxStateLoading(true)
+    setCarbonOxStateError('')
+    try {
+      const data = await getCarbonOxStateData(carbonOxStateDatasetSafe)
+      setCarbonOxStateResult(data)
+    } catch (err) {
+      setCarbonOxStateError(err.message || 'Failed to fetch Carbon Oxidation State data.')
+      setCarbonOxStateResult(null)
+    } finally {
+      setCarbonOxStateLoading(false)
+    }
+  }, [carbonOxStateDatasetSafe])
+
+  // Clear stale result when dataset changes
+  useEffect(() => {
+    setCarbonOxStateResult(null)
+    setCarbonOxStateAllCategories([])
+    setCarbonOxStateSelectedCategories([])
+  }, [carbonOxStateDatasetSafe])
+
+  useEffect(() => {
+    if (!carbonOxStateResult) return
+    const pts = carbonOxStateResult.points || []
+    const key = carbonOxStateFilterBy || 'superclass'
+    const cats = Array.from(new Set(pts.map(p => String(p[key] || 'Unclassified')))).sort()
+    setCarbonOxStateAllCategories(cats)
+    setCarbonOxStateSelectedCategories(cats)
+  }, [carbonOxStateResult, carbonOxStateFilterBy])
+
+  const toggleCarbonOxStateCategory = (cat) => {
+    setCarbonOxStateSelectedCategories(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat])
+  }
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -473,6 +735,38 @@ export default function MapPage({
     })
   }, [datasetScopedPoints, filters, allowedColumns, selectedSamples, metaboliteSampleKeys, mapData])
 
+  const visiblePointKeys = useMemo(() => {
+    const set = new globalThis.Set()
+    for (const p of points) {
+      const key = getPointSampleKey(p, mapData?.dataset_safe_map)
+      if (key) set.add(key)
+    }
+    return set
+  }, [points, mapData?.dataset_safe_map])
+
+  // Summary stats reflecting the currently active filters
+  const filteredStats = useMemo(() => {
+    const datasetDetails = mapData?.datasets_details || []
+    const visibleDatasetNames = new globalThis.Set(points.map((p) => String(p._dataset ?? 'N/A')))
+    const filteredDatasets = datasetDetails.filter((ds) => visibleDatasetNames.has(ds.name))
+    const features = filteredDatasets.reduce((sum, ds) => sum + (ds.n_features ?? 0), 0)
+    return {
+      datasets: filteredDatasets,
+      samples: points.length,
+      features,
+    }
+  }, [points, mapData?.datasets_details])
+
+  // Count how many map points belong to each dataset so the filter list matches dashboard totals
+  const datasetPointCounts = useMemo(() => {
+    const counts = {}
+    for (const p of mapData?.points ?? []) {
+      const name = String(p._dataset ?? 'N/A')
+      counts[name] = (counts[name] ?? 0) + 1
+    }
+    return counts
+  }, [mapData?.points])
+
   // Precompute colours for selected category values so recolouring is immediate.
   const colorLookup = useMemo(() => {
     const lookup = new globalThis.Map()
@@ -484,25 +778,72 @@ export default function MapPage({
     return lookup
   }, [columnValues, colorBy])
 
+  // Intensity scale derived from the feature currently applied to the map,
+  // restricted to positive-intensity samples that remain visible after current filters.
+  // Zero-intensity samples are tracked separately and rendered grey.
+  const intensityInfo = useMemo(() => {
+    if (!mapFeature?.present_samples?.length || metaboliteSampleKeys.size === 0) return null
+    const values = []
+    const byKey = new globalThis.Map()
+    for (const s of mapFeature.present_samples) {
+      const scaled = getIntensityScaleValue(s.intensity, intensityScale)
+      const datasetSafe = String(s.dataset_safe ?? '').trim()
+      const sampleId = String(s.sample_id ?? '').trim()
+      const key = `${datasetSafe}::${sampleId}`
+      if (scaled === null) continue
+      byKey.set(key, scaled)
+      if (scaled === 'zero') continue
+      if (visiblePointKeys.size === 0 || visiblePointKeys.has(key)) {
+        values.push(scaled)
+      }
+    }
+    if (!values.length) return null
+    const min = Math.min(...values)
+    const max = Math.max(...values)
+    const range = max - min || 1
+    return { byKey, min, max, range, scale: intensityScale }
+  }, [mapFeature, metaboliteSampleKeys, visiblePointKeys, intensityScale])
+
   // Deck.gl layer
   const layer = useMemo(() => {
     if (!points.length) return null
+    const intensityActive = !!intensityInfo
     return new ScatterplotLayer({
       id: 'metabolome-points',
       data: points,
       getPosition: (d) => [parseFloat(d._lon), parseFloat(d._lat)],
       getColor: (d) => {
+        if (intensityActive) {
+          const key = getPointSampleKey(d, mapData?.dataset_safe_map)
+          const scaled = key ? intensityInfo.byKey.get(key) : undefined
+          if (scaled === 'zero') return [128, 128, 128]
+          if (scaled !== undefined && typeof scaled === 'number') {
+            const t = (scaled - intensityInfo.min) / intensityInfo.range
+            return intensityRamp(t)
+          }
+        }
         const key = colorByRef.current ? String(d[colorByRef.current] ?? 'N/A') : String(d._dataset ?? 'N/A')
         return colorLookupRef.current.get(key) ?? strColor(key)
       },
-      getRadius: 55000,
+      getRadius: (d) => {
+        if (!intensityActive) return 55000
+        const key = getPointSampleKey(d, mapData?.dataset_safe_map)
+        const scaled = key ? intensityInfo.byKey.get(key) : undefined
+        if (scaled === 'zero') return 30000
+        if (scaled === undefined || typeof scaled !== 'number') return 55000
+        const t = (scaled - intensityInfo.min) / intensityInfo.range
+        const minR = 25000
+        const maxR = 105000
+        return minR + (maxR - minR) * t
+      },
       radiusUnits: 'meters',
       radiusMinPixels: 4,
-      radiusMaxPixels: 18,
+      radiusMaxPixels: 24,
       pickable: true,
       opacity: 0.75,
       updateTriggers: {
-        getColor: [colorBy, colorLookup],
+        getColor: [colorBy, colorLookup, intensityInfo],
+        getRadius: [intensityInfo],
       },
       onHover: ({ object, x, y }) => {
         if (hoverClearTimeoutRef.current) {
@@ -534,7 +875,7 @@ export default function MapPage({
         setHoverPanelActive(true)
       },
     })
-  }, [points, hoverPanelActive, colorBy, colorLookup])
+  }, [points, hoverPanelActive, colorBy, colorLookup, intensityInfo, mapData])
 
   const onAfterRender = useCallback(() => {
     setAppliedColorBy(colorByForAfterRender.current)
@@ -721,11 +1062,13 @@ export default function MapPage({
       (feature.present_samples ?? []).map((s) => `${String(s.dataset_safe)}::${String(s.sample_id)}`)
     )
     setMetaboliteSampleKeys(keys)
+    setMapFeature(feature)
     setSelectedFeature(feature)
   }
 
   const clearFeatureMapFilter = () => {
     setMetaboliteSampleKeys(new Set())
+    setMapFeature(null)
     setSelectedFeature(null)
   }
 
@@ -739,8 +1082,833 @@ export default function MapPage({
     return Number.isFinite(num) ? num.toFixed(4) : 'N/A'
   }
 
+  const renderMetaboliteBoxplots = () => {
+    const filteredMetabolites = boxplotAllMetabolites.filter(m => 
+      !boxplotSearch || m.id.toLowerCase().includes(boxplotSearch.toLowerCase())
+    ).slice(0, 500) // Limit to 500 for performance
+
+    const filteredSamples = boxplotAllSamples.filter(s => 
+      !boxplotSampleSearch || s.sample_id.toLowerCase().includes(boxplotSampleSearch.toLowerCase())
+    )
+
+    const samplesByGroup = {}
+    if (boxplotGroupBy) {
+      filteredSamples.forEach(s => {
+        const group = s[boxplotGroupBy] || 'N/A'
+        if (!samplesByGroup[group]) samplesByGroup[group] = []
+        samplesByGroup[group].push(s)
+      })
+    } else {
+      samplesByGroup['All Samples'] = filteredSamples
+    }
+
+    const toggleGroup = (groupSamples, isChecked) => {
+      setBoxplotSamples(prev => {
+        const next = new Set(prev)
+        groupSamples.forEach(s => {
+          if (isChecked) next.add(s.sample_id)
+          else next.delete(s.sample_id)
+        })
+        return Array.from(next)
+      })
+    }
+
+    const toggleGroupExpand = (groupName) => {
+      setBoxplotExpandedGroups(prev => ({
+        ...prev,
+        [groupName]: !prev[groupName]
+      }))
+    }
+
+    return (
+      <div className="grid grid-cols-12 gap-4 mt-3 pt-1">
+        {/* Left Column: Selection */}
+        <div className="col-span-4 space-y-4 pr-3 border-r border-slate-800">
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">1. Select Dataset</label>
+            <select
+              value={boxplotDatasetSafe}
+              onChange={(e) => setBoxplotDatasetSafe(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs text-slate-200 focus:outline-none"
+            >
+              <option value="">-- Select a Dataset --</option>
+              {(mapData?.datasets_details || []).map((d) => (
+                <option key={d.safe_name} value={d.safe_name}>{d.name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">2. Select Metabolite (Ordered by Intensity)</label>
+            <input
+              type="text"
+              placeholder="Search metabolites..."
+              value={boxplotSearch}
+              onChange={(e) => setBoxplotSearch(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-[11px] text-slate-200 placeholder:text-slate-500 focus:outline-none mb-1"
+            />
+            <div className="max-h-48 overflow-y-auto border border-slate-800 rounded bg-slate-950/40">
+              {filteredMetabolites.length === 0 ? (
+                <p className="p-2 text-[10px] text-slate-500 italic">No metabolites found</p>
+              ) : (
+                filteredMetabolites.map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => setBoxplotMetabolite(m.id)}
+                    className={`w-full text-left px-2 py-1 text-[10px] flex items-center justify-between hover:bg-slate-800/60 ${
+                      boxplotMetabolite === m.id ? 'bg-ocean-900/60 text-ocean-300 font-semibold' : 'text-slate-300'
+                    }`}
+                  >
+                    <span className="truncate pr-2">{m.id}</span>
+                    <span className="text-slate-500 text-[9px] tabular-nums shrink-0">{m.max_intensity.toExponential(1)}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">3. Select Metadata Category (Required)</label>
+            <select
+              value={boxplotGroupBy}
+              onChange={(e) => setBoxplotGroupBy(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs text-slate-200 focus:outline-none"
+            >
+              <option value="">-- Select Category --</option>
+              {boxplotMetadataColumns.map((col) => (
+                <option key={col} value={col}>{col}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">4. Select Samples (Grouped by {boxplotGroupBy || 'Category'})</label>
+            <div className="flex gap-1 mb-1">
+              <input
+                type="text"
+                placeholder="Search samples..."
+                value={boxplotSampleSearch}
+                onChange={(e) => setBoxplotSampleSearch(e.target.value)}
+                className="flex-1 rounded bg-slate-800 border border-slate-700 px-2 py-1 text-[11px] text-slate-200 placeholder:text-slate-500 focus:outline-none"
+              />
+              <button 
+                onClick={() => setBoxplotSamples([])}
+                className="text-[9px] text-slate-400 hover:text-slate-200 bg-slate-800 px-1.5 rounded"
+              >
+                None
+              </button>
+              <button 
+                onClick={() => setBoxplotSamples(boxplotAllSamples.map(s => s.sample_id))}
+                className="text-[9px] text-slate-400 hover:text-slate-200 bg-slate-800 px-1.5 rounded"
+              >
+                All
+              </button>
+            </div>
+            <div className="max-h-64 overflow-y-auto border border-slate-800 rounded bg-slate-950/40 space-y-2 p-1">
+              {Object.keys(samplesByGroup).sort().map(groupName => {
+                const groupSamples = samplesByGroup[groupName]
+                const selectedInGroup = groupSamples.filter(s => boxplotSamples.includes(s.sample_id))
+                const isAllChecked = selectedInGroup.length === groupSamples.length
+                const isPartial = selectedInGroup.length > 0 && selectedInGroup.length < groupSamples.length
+                const isExpanded = !!boxplotExpandedGroups[groupName]
+
+                return (
+                  <div key={groupName} className="border border-slate-800 rounded bg-slate-900/40 overflow-hidden">
+                    <div className="bg-slate-800/60 px-2 py-1 flex items-center justify-between">
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                        <input
+                          type="checkbox"
+                          checked={isAllChecked}
+                          ref={el => el && (el.indeterminate = isPartial)}
+                          onChange={(e) => toggleGroup(groupSamples, e.target.checked)}
+                          className="rounded scale-90 accent-ocean-500 shrink-0"
+                        />
+                        <button 
+                          onClick={() => toggleGroupExpand(groupName)}
+                          className="flex items-center gap-1.5 min-w-0 text-left"
+                        >
+                          <span className={`text-[10px] transition-transform ${isExpanded ? 'rotate-90' : ''}`}>▶</span>
+                          <span className="text-[10px] font-semibold text-slate-300 truncate" title={groupName}>
+                            {groupName}
+                          </span>
+                        </button>
+                      </div>
+                      <span className="text-[9px] text-slate-500 shrink-0">
+                        ({selectedInGroup.length}/{groupSamples.length})
+                      </span>
+                    </div>
+                    {isExpanded && (
+                      <div className="p-1 space-y-0.5 border-t border-slate-800/40">
+                        {groupSamples.map((s) => (
+                          <label
+                            key={s.sample_id}
+                            className={`flex items-center gap-2 px-1.5 py-0.5 text-[9px] cursor-pointer rounded hover:bg-slate-800/40 ${
+                              boxplotSamples.includes(s.sample_id) ? 'text-ocean-300' : 'text-slate-500'
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={boxplotSamples.includes(s.sample_id)}
+                              onChange={() => toggleBoxplotSample(s.sample_id)}
+                              className="rounded scale-75 accent-ocean-500"
+                            />
+                            <span className="truncate font-mono" title={s.sample_id}>{s.sample_id}</span>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+              {Object.keys(samplesByGroup).length === 0 && (
+                <p className="p-2 text-[10px] text-slate-500 italic">No samples match search.</p>
+              )}
+            </div>
+            <p className="text-[9px] text-slate-500 mt-1">{boxplotSamples.length} samples selected</p>
+          </div>
+
+          <button
+            onClick={runBoxplotAnalysis}
+            disabled={boxplotLoading || !boxplotMetabolite || boxplotSamples.length === 0 || !boxplotGroupBy}
+            className="w-full bg-ocean-700 hover:bg-ocean-600 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded py-2 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
+          >
+            {boxplotLoading ? <RefreshCw size={12} className="animate-spin" /> : <BarChart3 size={14} />}
+            Generate Boxplot
+          </button>
+          
+          {boxplotError && (
+            <p className="text-[10px] text-red-400 bg-red-950/20 border border-red-900/40 p-2 rounded">{boxplotError}</p>
+          )}
+        </div>
+
+        {/* Right Column: Plot */}
+        <div className="col-span-8 flex flex-col items-center justify-center bg-slate-950/50 border border-dashed border-slate-800 rounded-lg p-4 min-h-[400px]">
+          {boxplotLoading ? (
+            <div className="flex flex-col items-center gap-2">
+              <RefreshCw size={32} className="animate-spin text-ocean-400" />
+              <p className="text-xs text-slate-400">Loading intensities...</p>
+            </div>
+          ) : boxplotResult ? (
+            <div className="w-full h-full flex flex-col">
+              <h4 className="text-xs font-semibold text-slate-200 mb-2 truncate px-2">
+                Intensity Comparison: {boxplotMetabolite} {boxplotGroupBy ? `grouped by ${boxplotGroupBy}` : ''}
+              </h4>
+              <Plot
+                data={(() => {
+                  if (!boxplotGroupBy) {
+                    return [{
+                      x: boxplotResult.data.map(d => d.sample_id),
+                      y: boxplotResult.data.map(d => d.intensity),
+                      type: 'box',
+                      name: boxplotMetabolite,
+                      boxpoints: 'all',
+                      jitter: 0.3,
+                      pointpos: -1.8,
+                      marker: { color: '#0ea5e9' },
+                      line: { width: 1.5 }
+                    }]
+                  }
+                  
+                  // Group data by the selected metadata category
+                  const groups = {}
+                  boxplotResult.data.forEach(d => {
+                    const val = d.metadata[boxplotGroupBy] || 'N/A'
+                    if (!groups[val]) groups[val] = []
+                    groups[val].push(d.intensity)
+                  })
+                  
+                  return Object.keys(groups).sort().map((group, idx) => {
+                    const [r, g, b] = strColor(group)
+                    return {
+                      y: groups[group],
+                      type: 'box',
+                      name: group,
+                      boxpoints: 'all',
+                      jitter: 0.3,
+                      pointpos: -1.8,
+                      marker: { color: `rgb(${r},${g},${b})` },
+                      line: { width: 1.5 }
+                    }
+                  })
+                })()}
+                layout={{
+                  autosize: true,
+                  paper_bgcolor: 'white',
+                  plot_bgcolor: 'white',
+                  margin: { t: 30, r: 20, b: 80, l: 70 },
+                  showlegend: !!boxplotGroupBy,
+                  xaxis: {
+                    tickangle: 45,
+                    tickfont: { size: 10, color: '#334155' },
+                    gridcolor: '#f1f5f9',
+                    linecolor: '#cbd5e1',
+                  },
+                  yaxis: {
+                    title: 'Intensity',
+                    titlefont: { size: 12, color: '#1e293b', standoff: 15 },
+                    tickfont: { size: 10, color: '#334155' },
+                    gridcolor: '#f1f5f9',
+                    zerolinecolor: '#e2e8f0'
+                  },
+                  font: { color: '#1e293b' }
+                }}
+                useResizeHandler={true}
+                className="w-full h-[450px]"
+                config={{ responsive: true, displaylogo: false }}
+              />
+            </div>
+          ) : (
+            <div className="text-center space-y-2">
+              <BarChart3 size={48} className="text-slate-700 mx-auto" />
+              <p className="text-xs text-slate-400 font-medium">Boxplot Preview</p>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  const renderVanKrevelen = () => {
+    const rawPoints = vankrevelenResult?.points || []
+    
+    // First, filter by selected categories
+    const categoryFilteredPoints = rawPoints.filter(p => {
+      const catVal = String(p[vankrevelenFilterBy] || 'Unclassified')
+      return vankrevelenSelectedCategories.includes(catVal)
+    })
+
+    // Next, filter by search keyword
+    const filteredPoints = categoryFilteredPoints.filter(p => {
+      if (!vankrevelenSearch) return true
+      const q = vankrevelenSearch.toLowerCase()
+      return (
+        p.metabolite.toLowerCase().includes(q) ||
+        p.formula.toLowerCase().includes(q) ||
+        p.compound_name.toLowerCase().includes(q) ||
+        p.superclass.toLowerCase().includes(q) ||
+        p.class.toLowerCase().includes(q) ||
+        p.subclass.toLowerCase().includes(q)
+      )
+    })
+
+    const groups = {}
+    filteredPoints.forEach(p => {
+      const groupVal = p[vankrevelenColorBy] || 'Unclassified'
+      if (!groups[groupVal]) groups[groupVal] = []
+      groups[groupVal].push(p)
+    })
+
+    const plotlyData = Object.entries(groups).map(([groupName, pts]) => {
+      return {
+        x: pts.map(p => p.o_c),
+        y: pts.map(p => p.h_c),
+        mode: 'markers',
+        name: groupName,
+        type: 'scatter',
+        text: pts.map(p => {
+          const intensityStr = p.intensity ? Number(p.intensity).toExponential(2) : 'N/A'
+          return `<b>${p.compound_name || 'Unnamed Metabolite'}</b><br>` +
+                 `ID: ${p.metabolite}<br>` +
+                 `Formula: ${p.formula}<br>` +
+                 `O/C: ${p.o_c.toFixed(3)} | H/C: ${p.h_c.toFixed(3)}<br>` +
+                 `Mean Intensity: ${intensityStr}<br>` +
+                 `CANOPUS Superclass: ${p.superclass}<br>` +
+                 `CANOPUS Class: ${p.class}<br>` +
+                 `NPClassifier Pathway: ${p.npclassifier_pathway}`
+        }),
+        hoverinfo: 'text',
+        marker: {
+          size: pts.map(p => {
+            if (!p.intensity) return 6
+            const size = Math.max(5, Math.min(18, Math.log10(p.intensity) * 1.5))
+            return size
+          }),
+          opacity: 0.8,
+          line: {
+            color: 'rgba(255, 255, 255, 0.4)',
+            width: 0.5
+          }
+        }
+      }
+    })
+
+    return (
+      <div className="grid grid-cols-12 gap-4 mt-3 pt-1">
+        {/* Left column: Controls */}
+        <div className="col-span-4 space-y-4 pr-3 border-r border-slate-800">
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Dataset</label>
+            <select
+              value={vankrevelenDatasetSafe}
+              onChange={(e) => setVankrevelenDatasetSafe(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none"
+            >
+              <option value="">-- Select a Dataset --</option>
+              {(mapData?.datasets_details || []).map((d) => (
+                <option key={d.safe_name} value={d.safe_name}>{d.name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Filter By</label>
+            <select
+              value={vankrevelenFilterBy}
+              onChange={(e) => setVankrevelenFilterBy(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none"
+            >
+              <optgroup label="SIRIUS / CANOPUS Classifications">
+                <option value="superclass">CANOPUS Superclass</option>
+                <option value="class">CANOPUS Class</option>
+                <option value="subclass">CANOPUS Subclass</option>
+              </optgroup>
+              <optgroup label="NPClassifier Classifications">
+                <option value="npclassifier_superclass">NPClassifier Superclass</option>
+                <option value="npclassifier_class">NPClassifier Class</option>
+                <option value="npclassifier_pathway">NPClassifier Pathway</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Color By</label>
+            <select
+              value={vankrevelenColorBy}
+              onChange={(e) => setVankrevelenColorBy(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none"
+            >
+              <optgroup label="SIRIUS / CANOPUS Classifications">
+                <option value="superclass">CANOPUS Superclass</option>
+                <option value="class">CANOPUS Class</option>
+                <option value="subclass">CANOPUS Subclass</option>
+              </optgroup>
+              <optgroup label="NPClassifier Classifications">
+                <option value="npclassifier_superclass">NPClassifier Superclass</option>
+                <option value="npclassifier_class">NPClassifier Class</option>
+                <option value="npclassifier_pathway">NPClassifier Pathway</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Search Metabolites</label>
+            <input
+              type="text"
+              placeholder="Search ID, formula, compound, class..."
+              value={vankrevelenSearch}
+              onChange={(e) => setVankrevelenSearch(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none placeholder-slate-500"
+            />
+          </div>
+
+          <button
+            onClick={runVanKrevelenAnalysis}
+            disabled={vankrevelenLoading || !vankrevelenDatasetSafe}
+            className="w-full bg-ocean-700 hover:bg-ocean-600 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded py-2 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 mt-1"
+          >
+            {vankrevelenLoading ? <RefreshCw size={12} className="animate-spin" /> : <Layers size={14} />}
+            Apply Filters & Generate Plot
+          </button>
+
+          {/* Category Filtering checklist */}
+          {vankrevelenAllCategories.length > 0 && (
+            <div className="space-y-1.5 border-t border-slate-800 pt-3 mt-2">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Filter Groups</label>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setVankrevelenSelectedCategories(vankrevelenAllCategories)}
+                    className="text-[9px] text-ocean-400 hover:text-ocean-300 font-medium"
+                  >
+                    Select All
+                  </button>
+                  <button
+                    onClick={() => setVankrevelenSelectedCategories([])}
+                    className="text-[9px] text-slate-500 hover:text-slate-400 font-medium"
+                  >
+                    Clear All
+                  </button>
+                </div>
+              </div>
+              <div className="max-h-[140px] overflow-y-auto border border-slate-800 rounded bg-slate-900/40 p-2 space-y-1">
+                {vankrevelenAllCategories.map((cat) => {
+                  const isChecked = vankrevelenSelectedCategories.includes(cat)
+                  return (
+                    <label
+                      key={cat}
+                      className={`flex items-center gap-2 text-[10px] cursor-pointer rounded px-1 py-0.5 hover:bg-slate-800/40 ${
+                        isChecked ? 'text-slate-200' : 'text-slate-500'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => toggleVanKrevelenCategory(cat)}
+                        className="rounded scale-90 accent-ocean-500"
+                      />
+                      <span className="truncate" title={cat}>{cat}</span>
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {!vankrevelenError && vankrevelenResult && (
+            <div className="rounded bg-slate-850 border border-slate-800 p-2.5 text-[11px] text-slate-400 space-y-1 font-sans mt-3">
+              <p className="font-semibold text-slate-300">Van Krevelen Statistics</p>
+              <p>SIRIUS Annotated Features: <span className="text-emerald-400 font-medium">{vankrevelenResult.annotated_features ?? 0}</span></p>
+              <p>Filtered points (via search): <span className="text-slate-200 font-medium">{filteredPoints.length}</span></p>
+              <p>Unique color groups: <span className="text-slate-200 font-medium">{Object.keys(groups).length}</span></p>
+            </div>
+          )}
+        </div>
+
+        {/* Right column: Plot area with local loading */}
+        <div className="col-span-8 bg-white border border-slate-200 rounded-lg flex flex-col items-center p-2 min-h-[420px] justify-center relative">
+          {vankrevelenLoading ? (
+            <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2 text-center px-4">
+              <RefreshCw className="animate-spin text-ocean-400" size={32} />
+              <p className="text-sm font-medium text-slate-700">
+                Retrieving Annotated Features...
+              </p>
+              <p className="text-[10px] text-slate-500 max-w-[200px]">
+                Getting the top 1000 highest abundance features matching your precomputed SIRIUS annotations.
+              </p>
+            </div>
+          ) : !vankrevelenResult ? (
+            <div className="flex flex-col items-center justify-center text-center p-8 space-y-3">
+              <div className="w-16 h-16 rounded-full bg-slate-100 flex items-center justify-center text-slate-400">
+                <Layers size={32} />
+              </div>
+              <div>
+                <h4 className="text-sm font-semibold text-slate-700">Ready to Plot</h4>
+                <p className="text-[11px] text-slate-500 max-w-[240px] mt-1">
+                  Configure your dataset, then click <strong>Apply Filters & Generate Plot</strong>.
+                </p>
+              </div>
+            </div>
+          ) : filteredPoints.length > 0 ? (
+            <Plot
+              data={plotlyData}
+              layout={{
+                autosize: true,
+                paper_bgcolor: 'white',
+                plot_bgcolor: 'white',
+                font: { color: '#334155', size: 10 },
+                title: {
+                  text: `VAN KREVELEN PLOT (${vankrevelenDatasetSafe.replace('_', ' ')})`,
+                  font: { color: '#0f172a', size: 12, weight: 'bold' }
+                },
+                xaxis: {
+                  title: { text: 'Oxygen-to-Carbon Ratio (O/C)', font: { color: '#1e293b', size: 11 } },
+                  gridcolor: '#f1f5f9',
+                  linecolor: '#cbd5e1',
+                  tickfont: { color: '#334155' },
+                  range: [-0.05, 1.25]
+                },
+                yaxis: {
+                  title: { text: 'Hydrogen-to-Carbon Ratio (H/C)', font: { color: '#1e293b', size: 11 } },
+                  gridcolor: '#f1f5f9',
+                  linecolor: '#cbd5e1',
+                  tickfont: { color: '#334155' },
+                  range: [0.1, 2.5]
+                },
+                margin: { l: 50, r: 20, t: 50, b: 50 },
+                hovermode: 'closest',
+                showlegend: true,
+                legend: {
+                  font: { size: 9 },
+                  orientation: 'v',
+                  x: 1.02,
+                  y: 1
+                }
+              }}
+              useResizeHandler={true}
+              className="w-full h-full min-h-[400px]"
+              config={{ responsive: true, displayModeBar: false }}
+            />
+          ) : (
+            <div className="text-center py-12 text-xs text-slate-500">
+              No points matched your filters. Adjust search or select another dataset.
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  const renderCarbonOxState = () => {
+    const rawPoints = carbonOxStateResult?.points || []
+    
+    // First, filter by selected categories
+    const categoryFilteredPoints = rawPoints.filter(p => {
+      const catVal = String(p[carbonOxStateFilterBy] || 'Unclassified')
+      return carbonOxStateSelectedCategories.includes(catVal)
+    })
+
+    // Next, filter by search keyword
+    const filteredPoints = categoryFilteredPoints.filter(p => {
+      if (!carbonOxStateSearch) return true
+      const q = carbonOxStateSearch.toLowerCase()
+      return (
+        p.metabolite.toLowerCase().includes(q) ||
+        p.formula.toLowerCase().includes(q) ||
+        p.compound_name.toLowerCase().includes(q) ||
+        p.superclass.toLowerCase().includes(q) ||
+        p.class.toLowerCase().includes(q) ||
+        p.subclass.toLowerCase().includes(q)
+      )
+    })
+
+    const groups = {}
+    filteredPoints.forEach(p => {
+      const groupVal = p[carbonOxStateColorBy] || 'Unclassified'
+      if (!groups[groupVal]) groups[groupVal] = []
+      groups[groupVal].push(p)
+    })
+
+    const plotlyData = Object.entries(groups).map(([groupName, pts]) => {
+      return {
+        x: pts.map(p => p.cos),
+        y: pts.map(p => p.intensity),
+        mode: 'markers',
+        name: groupName,
+        type: 'scatter',
+        text: pts.map(p => {
+          const intensityStr = p.intensity ? Number(p.intensity).toExponential(2) : 'N/A'
+          return `<b>${p.compound_name || 'Unnamed Metabolite'}</b><br>` +
+                 `ID: ${p.metabolite}<br>` +
+                 `Formula: ${p.formula}<br>` +
+                 `COS: ${p.cos.toFixed(3)}<br>` +
+                 `Mean Intensity: ${intensityStr}<br>` +
+                 `CANOPUS Superclass: ${p.superclass}<br>` +
+                 `CANOPUS Class: ${p.class}<br>` +
+                 `NPClassifier Pathway: ${p.npclassifier_pathway}`
+        }),
+        hoverinfo: 'text',
+        marker: {
+          size: pts.map(p => {
+            if (!p.intensity) return 6
+            const size = Math.max(5, Math.min(18, Math.log10(p.intensity) * 1.5))
+            return size
+          }),
+          opacity: 0.8,
+          line: {
+            color: 'rgba(255, 255, 255, 0.4)',
+            width: 0.5
+          }
+        }
+      }
+    })
+
+    return (
+      <div className="grid grid-cols-12 gap-4 mt-3 pt-1">
+        {/* Left column: Controls */}
+        <div className="col-span-4 space-y-4 pr-3 border-r border-slate-800">
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Dataset</label>
+            <select
+              value={carbonOxStateDatasetSafe}
+              onChange={(e) => setCarbonOxStateDatasetSafe(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none"
+            >
+              <option value="">-- Select a Dataset --</option>
+              {(mapData?.datasets_details || []).map((d) => (
+                <option key={d.safe_name} value={d.safe_name}>{d.name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Filter By</label>
+            <select
+              value={carbonOxStateFilterBy}
+              onChange={(e) => setCarbonOxStateFilterBy(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none"
+            >
+              <optgroup label="SIRIUS / CANOPUS Classifications">
+                <option value="superclass">CANOPUS Superclass</option>
+                <option value="class">CANOPUS Class</option>
+                <option value="subclass">CANOPUS Subclass</option>
+              </optgroup>
+              <optgroup label="NPClassifier Classifications">
+                <option value="npclassifier_superclass">NPClassifier Superclass</option>
+                <option value="npclassifier_class">NPClassifier Class</option>
+                <option value="npclassifier_pathway">NPClassifier Pathway</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Color By</label>
+            <select
+              value={carbonOxStateColorBy}
+              onChange={(e) => setCarbonOxStateColorBy(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none"
+            >
+              <optgroup label="SIRIUS / CANOPUS Classifications">
+                <option value="superclass">CANOPUS Superclass</option>
+                <option value="class">CANOPUS Class</option>
+                <option value="subclass">CANOPUS Subclass</option>
+              </optgroup>
+              <optgroup label="NPClassifier Classifications">
+                <option value="npclassifier_superclass">NPClassifier Superclass</option>
+                <option value="npclassifier_class">NPClassifier Class</option>
+                <option value="npclassifier_pathway">NPClassifier Pathway</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Search Metabolites</label>
+            <input
+              type="text"
+              placeholder="Search ID, formula, compound, class..."
+              value={carbonOxStateSearch}
+              onChange={(e) => setCarbonOxStateSearch(e.target.value)}
+              className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-200 focus:outline-none placeholder-slate-500"
+            />
+          </div>
+
+          <button
+            onClick={runCarbonOxStateAnalysis}
+            disabled={carbonOxStateLoading || !carbonOxStateDatasetSafe}
+            className="w-full bg-ocean-700 hover:bg-ocean-600 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded py-2 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 mt-1"
+          >
+            {carbonOxStateLoading ? <RefreshCw size={12} className="animate-spin" /> : <Flame size={14} />}
+            Apply Filters & Generate Plot
+          </button>
+
+          {/* Category Filtering checklist */}
+          {carbonOxStateAllCategories.length > 0 && (
+            <div className="space-y-1.5 border-t border-slate-800 pt-3 mt-2">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Filter Groups</label>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setCarbonOxStateSelectedCategories(carbonOxStateAllCategories)}
+                    className="text-[9px] text-ocean-400 hover:text-ocean-300 font-medium"
+                  >
+                    Select All
+                  </button>
+                  <button
+                    onClick={() => setCarbonOxStateSelectedCategories([])}
+                    className="text-[9px] text-slate-500 hover:text-slate-400 font-medium"
+                  >
+                    Clear All
+                  </button>
+                </div>
+              </div>
+              <div className="max-h-[140px] overflow-y-auto border border-slate-800 rounded bg-slate-900/40 p-2 space-y-1">
+                {carbonOxStateAllCategories.map((cat) => {
+                  const isChecked = carbonOxStateSelectedCategories.includes(cat)
+                  return (
+                    <label
+                      key={cat}
+                      className={`flex items-center gap-2 text-[10px] cursor-pointer rounded px-1 py-0.5 hover:bg-slate-800/40 ${
+                        isChecked ? 'text-slate-200' : 'text-slate-500'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => toggleCarbonOxStateCategory(cat)}
+                        className="rounded scale-90 accent-ocean-500"
+                      />
+                      <span className="truncate" title={cat}>{cat}</span>
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {!carbonOxStateError && carbonOxStateResult && (
+            <div className="rounded bg-slate-850 border border-slate-800 p-2.5 text-[11px] text-slate-400 space-y-1 font-sans mt-3">
+              <p className="font-semibold text-slate-300">Carbon Oxidation State Statistics</p>
+              <p>SIRIUS Annotated Features: <span className="text-emerald-400 font-medium">{carbonOxStateResult.annotated_features ?? 0}</span></p>
+              <p>Filtered points (via search): <span className="text-slate-200 font-medium">{filteredPoints.length}</span></p>
+              <p>Unique color groups: <span className="text-slate-200 font-medium">{Object.keys(groups).length}</span></p>
+            </div>
+          )}
+        </div>
+
+        {/* Right column: Plot area with local loading */}
+        <div className="col-span-8 bg-white border border-slate-200 rounded-lg flex flex-col items-center p-2 min-h-[420px] justify-center relative">
+          {carbonOxStateLoading ? (
+            <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2 text-center px-4">
+              <RefreshCw className="animate-spin text-ocean-400" size={32} />
+              <p className="text-sm font-medium text-slate-700">
+                Calculating Carbon Oxidation State...
+              </p>
+              <p className="text-[10px] text-slate-500 max-w-[200px]">
+                Computing COS values for the top 1000 highest abundance features matching SIRIUS annotations.
+              </p>
+            </div>
+          ) : !carbonOxStateResult ? (
+            <div className="flex flex-col items-center justify-center text-center p-8 space-y-3">
+              <div className="w-16 h-16 rounded-full bg-slate-100 flex items-center justify-center text-slate-400">
+                <Flame size={32} />
+              </div>
+              <div>
+                <h4 className="text-sm font-semibold text-slate-700">Ready to Plot</h4>
+                <p className="text-[11px] text-slate-500 max-w-[240px] mt-1">
+                  Configure your dataset, then click <strong>Apply Filters & Generate Plot</strong>.
+                </p>
+              </div>
+            </div>
+          ) : filteredPoints.length > 0 ? (
+            <Plot
+              data={plotlyData}
+              layout={{
+                autosize: true,
+                paper_bgcolor: 'white',
+                plot_bgcolor: 'white',
+                font: { color: '#334155', size: 10 },
+                title: {
+                  text: `CARBON OXIDATION STATE (${carbonOxStateDatasetSafe.replace('_', ' ')})`,
+                  font: { color: '#0f172a', size: 12, weight: 'bold' }
+                },
+                xaxis: {
+                  title: { text: 'Carbon Oxidation State (COS)', font: { color: '#1e293b', size: 11 } },
+                  gridcolor: '#f1f5f9',
+                  linecolor: '#cbd5e1',
+                  tickfont: { color: '#334155' }
+                },
+                yaxis: {
+                  title: { text: 'Mean Intensity (log scale)', font: { color: '#1e293b', size: 11 } },
+                  gridcolor: '#f1f5f9',
+                  linecolor: '#cbd5e1',
+                  tickfont: { color: '#334155' },
+                  type: 'log'
+                },
+                margin: { l: 50, r: 20, t: 50, b: 50 },
+                hovermode: 'closest',
+                showlegend: true,
+                legend: {
+                  font: { size: 9 },
+                  orientation: 'v',
+                  x: 1.02,
+                  y: 1
+                }
+              }}
+              useResizeHandler={true}
+              className="w-full h-full min-h-[400px]"
+              config={{ responsive: true, displayModeBar: false }}
+            />
+          ) : (
+            <div className="text-center py-12 text-xs text-slate-500">
+              No points matched your filters. Adjust search or select another dataset.
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   const renderPcoaScatterPlot = () => {
-    if (!pcoaResult?.coordinates || pcoaResult.coordinates.length === 0) {
+    if (!pcoaResult?.scatter_plot) {
       return (
         <div className="text-center py-12 text-xs text-slate-500">
           No coordinates available. Try adjusting filters or select a different dataset.
@@ -748,383 +1916,43 @@ export default function MapPage({
       )
     }
 
-    const pcXValues = pcoaResult.coordinates.map((s) => s.coordinates[pcoaXAxis] ?? 0)
-    const pcYValues = pcoaResult.coordinates.map((s) => s.coordinates[pcoaYAxis] ?? 0)
-
-    const minX = Math.min(...pcXValues)
-    const maxX = Math.max(...pcXValues)
-    const minY = Math.min(...pcYValues)
-    const maxY = Math.max(...pcYValues)
-
-    const xSpan = maxX - minX || 1
-    const ySpan = maxY - minY || 1
-    const padXMin = minX - xSpan * 0.1
-    const padXMax = maxX + xSpan * 0.1
-    const padYMin = minY - ySpan * 0.1
-    const padYMax = maxY + ySpan * 0.1
-
-    const width = 450
-    const height = 300
-    const margin = { top: 20, right: 20, bottom: 40, left: 50 }
-
-    const scaleX = (val) => margin.left + ((val - padXMin) / (padXMax - padXMin)) * (width - margin.left - margin.right)
-    const scaleY = (val) => height - margin.bottom - ((val - padYMin) / (padYMax - padYMin)) * (height - margin.top - margin.bottom)
-
-    const uniqueColors = Array.from(new Set(pcoaResult.coordinates.map((s) => s.color_value)))
-    const colorPalette = ['#38bdf8', '#f43f5e', '#10b981', '#fbbf24', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316', '#a3e635', '#c084fc']
-    const colorMap = {}
-    uniqueColors.forEach((val, i) => {
-      colorMap[val] = colorPalette[i % colorPalette.length]
-    })
-
-    const uniqueAttrs = Array.from(new Set(pcoaResult.coordinates.map((s) => s.shape_value)))
-    const attrColorMap = {}
-    uniqueAttrs.forEach((val, i) => {
-      attrColorMap[val] = colorPalette[(i + 5) % colorPalette.length]
-    })
-
-    const renderShapeNode = (cx, cy, color, sampleId, s) => {
-      const size = 5
-      const handleMouseOver = (e) => {
-        const bounds = e.currentTarget.getBoundingClientRect()
-        setPcoaTooltip({
-          sample_id: sampleId,
-          color_value: s.color_value,
-          shape_value: s.shape_value,
-          x: s.coordinates[pcoaXAxis],
-          y: s.coordinates[pcoaYAxis],
-          clientX: bounds.left + window.scrollX,
-          clientY: bounds.top + window.scrollY - 100,
-        })
-      }
-
-      return (
-        <circle
-          cx={cx}
-          cy={cy}
-          r={size}
-          fill={color}
-          className="hover:stroke-white hover:stroke-2 cursor-pointer transition-all duration-150"
-          onMouseOver={handleMouseOver}
-          onMouseOut={() => setPcoaTooltip(null)}
-        />
-      )
-    }
-
-    const pcXIndex = parseInt(pcoaXAxis.replace('PC', '')) - 1
-    const pcYIndex = parseInt(pcoaYAxis.replace('PC', '')) - 1
-    const pcXExplained = ((pcoaResult.proportion_explained[pcXIndex] || 0) * 100).toFixed(1)
-    const pcYExplained = ((pcoaResult.proportion_explained[pcYIndex] || 0) * 100).toFixed(1)
-
-    // Interactivity: Drag to Pan
-    const handlePcoaMouseDown = (e) => {
-      if (e.button !== 0) return
-      setPcoaDragStart({
-        x: e.clientX - pcoaPan.x,
-        y: e.clientY - pcoaPan.y,
-      })
-    }
-
-    const handlePcoaMouseMove = (e) => {
-      if (!pcoaDragStart) return
-      setPcoaPan({
-        x: e.clientX - pcoaDragStart.x,
-        y: e.clientY - pcoaDragStart.y,
-      })
-    }
-
-    const handlePcoaMouseUp = () => {
-      setPcoaDragStart(null)
-    }
-
-    // Interactivity: Wheel Scroll Zoom
-    const handlePcoaWheel = (e) => {
-      e.preventDefault()
-      const zoomFactor = 1.15
-      let nextZoom = pcoaZoom
-      if (e.deltaY < 0) {
-        nextZoom = Math.min(nextZoom * zoomFactor, 25)
-      } else {
-        nextZoom = Math.max(nextZoom / zoomFactor, 0.4)
-      }
-
-      const rect = e.currentTarget.getBoundingClientRect()
-      const mouseX = e.clientX - rect.left
-      const mouseY = e.clientY - rect.top
-
-      const dx = mouseX - pcoaPan.x
-      const dy = mouseY - pcoaPan.y
-
-      setPcoaPan({
-        x: mouseX - dx * (nextZoom / pcoaZoom),
-        y: mouseY - dy * (nextZoom / pcoaZoom),
-      })
-      setPcoaZoom(nextZoom)
-    }
-
-    const handlePcoaReset = () => {
-      setPcoaZoom(1)
-      setPcoaPan({ x: 0, y: 0 })
-    }
-
     return (
       <div className="relative grid grid-cols-12 gap-4">
-        <div className="col-span-8 bg-slate-950 border border-slate-800 rounded-lg p-2 flex flex-col items-center select-none relative">
-          
-          {/* Legend / Info bar */}
-          <div className="absolute top-2 right-2 flex items-center gap-1.5 z-10">
-            <span className="text-[9px] text-slate-500 font-medium">Scroll to Zoom • Drag to Pan</span>
-            <button
-              onClick={handlePcoaReset}
-              className="text-[9px] bg-slate-800 hover:bg-slate-700 hover:text-slate-100 text-slate-300 rounded px-1.5 py-0.5 border border-slate-700 transition-colors"
-            >
-              Reset View
-            </button>
-          </div>
-
-          <svg
-            width={width}
-            height={height}
-            className="overflow-visible cursor-grab active:cursor-grabbing"
-            onMouseDown={handlePcoaMouseDown}
-            onMouseMove={handlePcoaMouseMove}
-            onMouseUp={handlePcoaMouseUp}
-            onMouseLeave={handlePcoaMouseUp}
-            onWheel={handlePcoaWheel}
-          >
-            {/* Cliping path definitions so zoomed elements don't spill outside grid margins */}
-            <defs>
-              <clipPath id="pcoa-plot-clip">
-                <rect
-                  x={margin.left}
-                  y={margin.top}
-                  width={width - margin.left - margin.right}
-                  height={height - margin.top - margin.bottom}
-                />
-              </clipPath>
-            </defs>
-
-            {/* Static Outer Border */}
-            <rect
-              x={margin.left}
-              y={margin.top}
-              width={width - margin.left - margin.right}
-              height={height - margin.top - margin.bottom}
-              fill="none"
-              stroke="#334155"
-              strokeWidth={1}
-              style={{ zIndex: 10 }}
-            />
-
-            {/* Zoomable & Pannable Plot Content Area */}
-            <g clipPath="url(#pcoa-plot-clip)">
-              <g transform={`translate(${pcoaPan.x}, ${pcoaPan.y}) scale(${pcoaZoom})`}>
-                
-                {/* Horizontal grid lines */}
-                {Array.from({ length: 5 }).map((_, i) => {
-                  const val = padYMin + (i * (padYMax - padYMin)) / 4
-                  const cy = scaleY(val)
-                  return (
-                    <line
-                      key={`h-${i}`}
-                      x1={margin.left - 1000}
-                      y1={cy}
-                      x2={width - margin.right + 1000}
-                      y2={cy}
-                      stroke="#111827"
-                      strokeWidth={0.5 / pcoaZoom}
-                      strokeDasharray="4,4"
-                    />
-                  )
-                })}
-
-                {/* Vertical grid lines */}
-                {Array.from({ length: 5 }).map((_, i) => {
-                  const val = padXMin + (i * (padXMax - padXMin)) / 4
-                  const cx = scaleX(val)
-                  return (
-                    <line
-                      key={`v-${i}`}
-                      x1={cx}
-                      y1={margin.top - 1000}
-                      x2={cx}
-                      y2={height - margin.bottom + 1000}
-                      stroke="#111827"
-                      strokeWidth={0.5 / pcoaZoom}
-                      strokeDasharray="4,4"
-                    />
-                  )
-                })}
-
-                {/* Main Zero Center Lines */}
-                {padXMin < 0 && padXMax > 0 && (
-                  <line
-                    x1={scaleX(0)}
-                    y1={margin.top - 1000}
-                    x2={scaleX(0)}
-                    y2={height - margin.bottom + 1000}
-                    stroke="#1e293b"
-                    strokeWidth={1 / pcoaZoom}
-                  />
-                )}
-                {padYMin < 0 && padYMax > 0 && (
-                  <line
-                    x1={margin.left - 1000}
-                    y1={scaleY(0)}
-                    x2={width - margin.right + 1000}
-                    y2={scaleY(0)}
-                    stroke="#1e293b"
-                    strokeWidth={1 / pcoaZoom}
-                  />
-                )}
-
-                {/* Render Circular Data Points */}
-                {pcoaResult.coordinates.map((s) => {
-                  const cx = scaleX(s.coordinates[pcoaXAxis] ?? 0)
-                  const cy = scaleY(s.coordinates[pcoaYAxis] ?? 0)
-                  const color = colorMap[s.color_value] || '#e2e8f0'
-                  return (
-                    <g key={s.sample_id}>
-                      {renderShapeNode(cx, cy, color, s.sample_id, s)}
-                    </g>
-                  )
-                })}
-              </g>
-            </g>
-
-            {/* Static Axis Labels */}
-            <text
-              x={margin.left + (width - margin.left - margin.right) / 2}
-              y={height - 10}
-              fill="#94a3b8"
-              fontSize={10}
-              textAnchor="middle"
-              className="font-medium"
-            >
-              {pcoaXAxis} ({pcXExplained}%)
-            </text>
-
-            <text
-              transform="rotate(-90)"
-              x={-(margin.top + (height - margin.top - margin.bottom) / 2)}
-              y={15}
-              fill="#94a3b8"
-              fontSize={10}
-              textAnchor="middle"
-              className="font-medium"
-            >
-              {pcoaYAxis} ({pcYExplained}%)
-            </text>
-
-            {/* Dynamic Axis Coordinates */}
-            {[padXMin, padXMin + (padXMax - padXMin)/2, padXMax].map((val, i) => {
-              const rawX = scaleX(val)
-              const cx = rawX * pcoaZoom + pcoaPan.x
-              
-              if (cx < margin.left || cx > width - margin.right) return null
-
-              return (
-                <text
-                  key={`xl-${i}`}
-                  x={cx}
-                  y={height - margin.bottom + 12}
-                  fill="#64748b"
-                  fontSize={8}
-                  textAnchor="middle"
-                >
-                  {val.toFixed(2)}
-                </text>
-              )
-            })}
-
-            {[padYMin, padYMin + (padYMax - padYMin)/2, padYMax].map((val, i) => {
-              const rawY = scaleY(val)
-              const cy = rawY * pcoaZoom + pcoaPan.y
-              
-              if (cy < margin.top || cy > height - margin.bottom) return null
-
-              return (
-                <text
-                  key={`yl-${i}`}
-                  x={margin.left - 6}
-                  y={cy + 3}
-                  fill="#64748b"
-                  fontSize={8}
-                  textAnchor="end"
-                >
-                  {val.toFixed(2)}
-                </text>
-              )
-            })}
-          </svg>
-
-          {pcoaTooltip && (
-            <div
-              className="fixed z-50 bg-slate-900 border border-slate-700 rounded p-2 shadow-xl text-[10px] text-slate-300 space-y-1 select-none pointer-events-none"
-              style={{ left: pcoaTooltip.clientX, top: pcoaTooltip.clientY }}
-            >
-              <div className="font-bold text-slate-100 border-b border-slate-850 pb-1 mb-1 truncate max-w-[180px]">
-                {pcoaTooltip.sample_id}
-              </div>
-              <div>
-                <span className="text-slate-500 font-semibold">{pcoaColorBy}:</span> {pcoaTooltip.color_value}
-              </div>
-              {pcoaAttribute !== pcoaColorBy && (
-                <div>
-                  <span className="text-slate-500 font-semibold">{pcoaAttribute}:</span> {pcoaTooltip.shape_value}
-                </div>
-              )}
-              <div>
-                <span className="text-slate-500 font-semibold">{pcoaXAxis}:</span> {pcoaTooltip.x.toFixed(4)}
-              </div>
-              <div>
-                <span className="text-slate-500 font-semibold">{pcoaYAxis}:</span> {pcoaTooltip.y.toFixed(4)}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="col-span-4 space-y-3 max-h-[300px] overflow-y-auto pr-1">
-          <div className="space-y-1">
-            <h4 className="text-[10px] uppercase font-bold text-slate-400 tracking-wide border-b border-slate-800 pb-0.5">
-              Groups ({pcoaColorBy})
-            </h4>
-            <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
-              {Object.entries(colorMap).map(([val, color]) => (
-                <div key={val} className="flex items-center gap-2 text-xs text-slate-300 py-0.5">
-                  <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: color }} />
-                  <span className="truncate text-[11px]" title={val}>{val}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {pcoaAttribute && pcoaAttribute !== pcoaColorBy && (
-            <div className="space-y-1">
-              <h4 className="text-[10px] uppercase font-bold text-slate-400 tracking-wide border-b border-slate-800 pb-0.5">
-                Filter ({pcoaAttribute})
-              </h4>
-              <div className="space-y-0.5 max-h-[100px] overflow-y-auto">
-                {Object.entries(attrColorMap).map(([val, color]) => {
-                  return (
-                    <div key={val} className="flex items-center gap-2 text-xs text-slate-300 py-0.5">
-                      <span className="w-2.5 text-center flex-shrink-0 text-[10px]" style={{ color }}>
-                        ●
-                      </span>
-                      <span className="truncate text-[11px]" title={val}>{val}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          )}
+        <div className="col-span-12 bg-white border border-slate-200 rounded-lg flex flex-col items-center p-2">
+          <Plot
+            data={pcoaResult.scatter_plot.data}
+            layout={{
+              ...pcoaResult.scatter_plot.layout,
+              autosize: true,
+              paper_bgcolor: 'white',
+              plot_bgcolor: 'white',
+              font: { color: '#334155' },
+              xaxis: {
+                ...pcoaResult.scatter_plot.layout.xaxis,
+                gridcolor: '#f1f5f9',
+                linecolor: '#cbd5e1',
+                tickfont: { color: '#334155' },
+                title: { ...pcoaResult.scatter_plot.layout.xaxis?.title, font: { color: '#1e293b' } }
+              },
+              yaxis: {
+                ...pcoaResult.scatter_plot.layout.yaxis,
+                gridcolor: '#f1f5f9',
+                linecolor: '#cbd5e1',
+                tickfont: { color: '#334155' },
+                title: { ...pcoaResult.scatter_plot.layout.yaxis?.title, font: { color: '#1e293b' } }
+              }
+            }}
+            useResizeHandler={true}
+            className="w-full min-h-[400px]"
+            config={{ responsive: true, displayModeBar: true }}
+          />
         </div>
       </div>
     )
   }
 
   const renderVarianceBarChart = () => {
-    if (!pcoaResult?.proportion_explained || pcoaResult.proportion_explained.length === 0) {
+    if (!pcoaResult?.variance_plot) {
       return (
         <div className="text-center py-12 text-xs text-slate-500">
           No variance data available.
@@ -1132,114 +1960,74 @@ export default function MapPage({
       )
     }
 
-    const variancePercents = pcoaResult.proportion_explained.map((v) => v * 100)
-    const maxVal = Math.max(...variancePercents) || 1
-
-    const width = 450
-    const height = 280
-    const margin = { top: 20, right: 20, bottom: 40, left: 40 }
-
-    const barWidth = 24
-    const spacing = 12
-
     return (
-      <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex flex-col items-center">
-        <h4 className="text-xs font-semibold text-slate-200 mb-3 self-start">PCoA Scree Plot (Explained Variance)</h4>
-        <svg width={width} height={height} className="overflow-visible">
-          {Array.from({ length: 5 }).map((_, i) => {
-            const val = (i * maxVal) / 4
-            const cy = height - margin.bottom - (val / maxVal) * (height - margin.top - margin.bottom)
-            return (
-              <line
-                key={`v-grid-${i}`}
-                x1={margin.left}
-                y1={cy}
-                x2={width - margin.right}
-                y2={cy}
-                stroke="#1e293b"
-                strokeWidth={0.5}
-              />
-            )
-          })}
-
-          {variancePercents.map((v, i) => {
-            const barHeight = (v / maxVal) * (height - margin.top - margin.bottom)
-            const x = margin.left + i * (barWidth + spacing) + spacing
-            const y = height - margin.bottom - barHeight
-
-            return (
-              <g key={`bar-${i}`} className="group cursor-pointer">
-                <rect
-                  x={x}
-                  y={y}
-                  width={barWidth}
-                  height={barHeight}
-                  fill={pcoaXAxis === `PC${i+1}` || pcoaYAxis === `PC${i+1}` ? '#38bdf8' : '#475569'}
-                  className="hover:fill-ocean-500 transition-colors duration-150"
-                  rx={1}
-                />
-                <text
-                  x={x + barWidth / 2}
-                  y={y - 4}
-                  fill="#cbd5e1"
-                  fontSize={8}
-                  textAnchor="middle"
-                  className="opacity-0 group-hover:opacity-100 transition-opacity font-medium"
-                >
-                  {v.toFixed(1)}%
-                </text>
-                <text
-                  x={x + barWidth / 2}
-                  y={height - margin.bottom + 12}
-                  fill="#94a3b8"
-                  fontSize={8}
-                  textAnchor="middle"
-                  className="font-medium"
-                >
-                  PC{i+1}
-                </text>
-              </g>
-            )
-          })}
-
-          <line
-            x1={margin.left}
-            y1={height - margin.bottom}
-            x2={width - margin.right}
-            y2={height - margin.bottom}
-            stroke="#475569"
-            strokeWidth={1}
-          />
-          <line
-            x1={margin.left}
-            y1={margin.top}
-            x2={margin.left}
-            y2={height - margin.bottom}
-            stroke="#475569"
-            strokeWidth={1}
-          />
-
-          {[0, maxVal / 2, maxVal].map((val, i) => {
-            const cy = height - margin.bottom - (val / maxVal) * (height - margin.top - margin.bottom)
-            return (
-              <text
-                key={`y-label-${i}`}
-                x={margin.left - 6}
-                y={cy + 3}
-                fill="#64748b"
-                fontSize={8}
-                textAnchor="end"
-              >
-                {val.toFixed(1)}%
-              </text>
-            )
-          })}
-        </svg>
+      <div className="bg-white border border-slate-200 rounded-lg p-3 flex flex-col items-center">
+        <Plot
+          data={pcoaResult.variance_plot.data}
+          layout={{
+            ...pcoaResult.variance_plot.layout,
+            autosize: true,
+            paper_bgcolor: 'white',
+            plot_bgcolor: 'white',
+            font: { color: '#334155' },
+            xaxis: {
+              ...pcoaResult.variance_plot.layout.xaxis,
+              gridcolor: '#f1f5f9',
+              linecolor: '#cbd5e1',
+              tickfont: { color: '#334155' }
+            },
+            yaxis: {
+              ...pcoaResult.variance_plot.layout.yaxis,
+              gridcolor: '#f1f5f9',
+              linecolor: '#cbd5e1',
+              tickfont: { color: '#334155' }
+            }
+          }}
+          useResizeHandler={true}
+          className="w-full min-h-[300px]"
+          config={{ responsive: true, displayModeBar: false }}
+        />
       </div>
     )
   }
 
 
+
+  const renderPermanovaStats = () => {
+    if (!pcoaResult?.permanova) {
+      return (
+        <div className="text-center py-12 text-xs text-slate-500">
+          PERMANOVA results not available (requires at least 2 categories and 2 samples per category).
+        </div>
+      )
+    }
+
+    return (
+      <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2">
+        <div className="flex items-center justify-between pb-1 border-b border-slate-800">
+          <h4 className="text-xs font-semibold text-slate-200">PERMANOVA Statistics</h4>
+        </div>
+        <div className="overflow-hidden border border-slate-800 rounded">
+          <table className="w-full text-[11px] text-left border-collapse">
+            <thead className="bg-slate-900 border-b border-slate-800 text-slate-400">
+              <tr>
+                <th className="px-3 py-2 font-semibold border-r border-slate-800 w-1/2">Metric</th>
+                <th className="px-3 py-2 font-semibold w-1/2">Value</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-850">
+              {pcoaResult.permanova.map((row, i) => (
+                <tr key={i} className="hover:bg-slate-800/30 text-slate-300">
+                  <td className="px-3 py-1.5 font-medium border-r border-slate-850 bg-slate-900/20">{row.Metric}</td>
+                  <td className="px-3 py-1.5 font-mono">{row.Value}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    )
+  }
 
   const renderCoordinatesData = () => {
     if (!pcoaResult?.coordinates || pcoaResult.coordinates.length === 0) {
@@ -1249,6 +2037,12 @@ export default function MapPage({
         </div>
       )
     }
+
+    // Determine how many PCs are actually returned (up to 10)
+    const pcKeys = Object.keys(pcoaResult.coordinates[0]?.coordinates || {})
+      .filter(k => k.startsWith('PC'))
+      .sort((a, b) => parseInt(a.replace('PC', '')) - parseInt(b.replace('PC', '')))
+      .slice(0, 10)
 
     return (
       <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2">
@@ -1262,11 +2056,11 @@ export default function MapPage({
             <thead>
               <tr className="bg-slate-900 border-b border-slate-800 text-slate-400 sticky top-0">
                 <th className="px-2 py-1 font-semibold border-r border-slate-800">Sample ID</th>
-                <th className="px-2 py-1 font-semibold text-right border-r border-slate-800">PC1</th>
-                <th className="px-2 py-1 font-semibold text-right border-r border-slate-800">PC2</th>
-                <th className="px-2 py-1 font-semibold text-right border-r border-slate-800">PC3</th>
-                <th className="px-2 py-1 font-semibold text-right border-r border-slate-800">PC4</th>
-                <th className="px-2 py-1 font-semibold text-right">PC5</th>
+                {pcKeys.map((pc, idx) => (
+                  <th key={pc} className={`px-2 py-1 font-semibold text-right ${idx < pcKeys.length - 1 ? 'border-r border-slate-800' : ''}`}>
+                    {pc}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-850">
@@ -1275,11 +2069,11 @@ export default function MapPage({
                   <td className="px-2 py-1 font-mono text-slate-200 font-medium truncate max-w-[120px] border-r border-slate-850" title={row.sample_id}>
                     {row.sample_id}
                   </td>
-                  <td className="px-2 py-1 text-right font-mono border-r border-slate-850">{(row.coordinates.PC1 ?? 0).toFixed(4)}</td>
-                  <td className="px-2 py-1 text-right font-mono border-r border-slate-850">{(row.coordinates.PC2 ?? 0).toFixed(4)}</td>
-                  <td className="px-2 py-1 text-right font-mono border-r border-slate-850">{(row.coordinates.PC3 ?? 0).toFixed(4)}</td>
-                  <td className="px-2 py-1 text-right font-mono border-r border-slate-850">{(row.coordinates.PC4 ?? 0).toFixed(4)}</td>
-                  <td className="px-2 py-1 text-right font-mono">{(row.coordinates.PC5 ?? 0).toFixed(4)}</td>
+                  {pcKeys.map((pc, idx) => (
+                    <td key={pc} className={`px-2 py-1 text-right font-mono ${idx < pcKeys.length - 1 ? 'border-r border-slate-850' : ''}`}>
+                      {(row.coordinates[pc] ?? 0).toFixed(4)}
+                    </td>
+                  ))}
                 </tr>
               ))}
             </tbody>
@@ -1386,15 +2180,10 @@ export default function MapPage({
         <div className="absolute top-3 left-3 z-10 flex flex-col gap-2">
           <StatsPanel
             datasets={mapData.datasets_details || mapData.datasets || []}
-            samples={mapData.total_samples ?? 0}
-            features={mapData.total_features ?? 0}
+            visibleDatasets={filteredStats.datasets}
+            samples={filteredStats.samples}
+            features={filteredStats.features}
           />
-          <button
-            onClick={() => setHeatmapOpen(true)}
-            className="self-start bg-slate-800/95 hover:bg-slate-700/95 border border-slate-700 rounded-lg px-3 py-1.5 flex items-center gap-1.5 text-xs text-slate-200 hover:text-white transition-all shadow-lg active:scale-[0.98] font-semibold"
-          >
-            <Grid size={13} className="text-ocean-400" /> View Intensity Heatmap
-          </button>
         </div>
       )}
 
@@ -1420,16 +2209,30 @@ export default function MapPage({
         </button>
       </div>
 
-      {selectedFeature && metaboliteSampleKeys.size > 0 && (
-        <div className="absolute top-14 right-3 z-10 bg-ocean-900/80 border border-ocean-700 rounded-lg px-3 py-2 text-[11px] text-ocean-100 max-w-md">
-          Showing samples for <span className="font-semibold">{selectedFeature.metabolite}</span> ({metaboliteSampleKeys.size.toLocaleString()} samples)
-        </div>
-      )}
+      {mapFeature && metaboliteSampleKeys.size > 0 && (() => {
+        const totalSamples = mapFeature.present_samples?.length ?? metaboliteSampleKeys.size
+        const visibleCount = points.length
+        const filterDescription = describeActiveSampleFilters(filters, selectedSamples, sampleSearch)
+        return (
+          <div className="absolute top-14 right-3 z-10 bg-ocean-900/80 border border-ocean-700 rounded-lg px-3 py-2 text-[11px] text-ocean-100 max-w-md">
+            <p>
+              Showing samples for <span className="font-semibold">{mapFeature.metabolite}</span>
+            </p>
+            <p className="text-ocean-200/80 mt-0.5">
+              Filters: {filterDescription}
+            </p>
+            <p className="text-ocean-200/80">
+              {visibleCount.toLocaleString()} of {totalSamples.toLocaleString()} metabolite samples visible
+              {visibleCount < totalSamples && ` (${(totalSamples - visibleCount).toLocaleString()} filtered out)`}
+            </p>
+          </div>
+        )
+      })()}
 
       {/* Global analysis dashboard */}
       {analysisOpen && (
         <div className={`absolute top-12 right-3 z-20 bg-slate-900/95 border border-slate-700 rounded-xl p-4 shadow-xl transition-all duration-300 max-h-[85vh] overflow-y-auto ${
-          globalAnalysisOption === 'PCoA' && pcoaDashboardExpanded ? 'w-[60rem]' : 'w-80'
+          (globalAnalysisOption === 'PCoA' && pcoaDashboardExpanded) || globalAnalysisOption === 'Metabolite Boxplots' || globalAnalysisOption === 'Van Krevelen' || globalAnalysisOption === 'Carbon Ox State' ? 'w-[60rem]' : 'w-80'
         }`}>
           <div className="flex items-center justify-between pb-3 border-b border-slate-800">
             <div className="flex items-center gap-2">
@@ -1526,7 +2329,7 @@ export default function MapPage({
                       </button>
                     </div>
                     
-                    <div className="max-h-60 overflow-y-auto border border-slate-800 rounded bg-slate-950 p-1.5 space-y-2">
+                    <div className="max-h-60 overflow-y-auto border border-slate-800 rounded bg-slate-950/40 p-1.5 space-y-2">
                       {(pcoaAllCategories || []).map((cat) => {
                         const samplesInCat = pcoaSamplesByGroup[cat] || []
                         const selectedSamplesInCat = samplesInCat.filter(s => pcoaSamples.includes(s.sample_id))
@@ -1644,7 +2447,7 @@ export default function MapPage({
                       onChange={(e) => setPcoaXAxis(e.target.value)}
                       className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs text-slate-200 focus:outline-none"
                     >
-                      {Array.from({ length: pcoaResult?.proportion_explained?.length || 2 }).map((_, i) => (
+                      {Array.from({ length: Math.min(10, pcoaResult?.proportion_explained?.length || 2) }).map((_, i) => (
                         <option key={i} value={`PC${i+1}`}>PC{i+1}</option>
                       ))}
                     </select>
@@ -1656,7 +2459,7 @@ export default function MapPage({
                       onChange={(e) => setPcoaYAxis(e.target.value)}
                       className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs text-slate-200 focus:outline-none"
                     >
-                      {Array.from({ length: pcoaResult?.proportion_explained?.length || 2 }).map((_, i) => (
+                      {Array.from({ length: Math.min(10, pcoaResult?.proportion_explained?.length || 2) }).map((_, i) => (
                         <option key={i} value={`PC${i+1}`}>PC{i+1}</option>
                       ))}
                     </select>
@@ -1682,6 +2485,7 @@ export default function MapPage({
                       {[
                         { id: 'plot', label: 'Scatter Plot' },
                         { id: 'variance', label: 'Explained Variance' },
+                        { id: 'permanova', label: 'PERMANOVA' },
                         { id: 'data', label: 'Coordinates Data' },
                       ].map((t) => (
                         <button
@@ -1710,9 +2514,10 @@ export default function MapPage({
                         <div>{pcoaError}</div>
                       </div>
                     ) : (
-                      <div>
+                      <div className="pt-2">
                         {pcoaActiveTab === 'plot' && renderPcoaScatterPlot()}
                         {pcoaActiveTab === 'variance' && renderVarianceBarChart()}
+                        {pcoaActiveTab === 'permanova' && renderPermanovaStats()}
                         {pcoaActiveTab === 'data' && renderCoordinatesData()}
                       </div>
                     )}
@@ -1740,6 +2545,12 @@ export default function MapPage({
                     Expand PCoA Dashboard
                   </button>
                 </div>
+              ) : globalAnalysisOption === 'Metabolite Boxplots' ? (
+                renderMetaboliteBoxplots()
+              ) : globalAnalysisOption === 'Van Krevelen' ? (
+                renderVanKrevelen()
+              ) : globalAnalysisOption === 'Carbon Ox State' ? (
+                renderCarbonOxState()
               ) : (
                 <div className="rounded bg-yellow-900/20 border border-yellow-700/40 px-2 py-1.5 text-[10px] text-yellow-300">
                   <strong>{globalAnalysisOption}</strong> dashboard view is ready. Plot rendering can be connected next.
@@ -1794,14 +2605,16 @@ export default function MapPage({
             className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1.5 text-[11px] text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-ocean-500"
           />
 
-          <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer hover:bg-slate-800/30 p-1 rounded transition-colors select-none">
+          <label className="flex items-start gap-2 text-[10px] text-slate-300 cursor-pointer select-none leading-tight">
             <input
               type="checkbox"
               checked={!!metaboliteQuery.has_annotation}
               onChange={(e) => setMetaboliteQuery((q) => ({ ...q, has_annotation: e.target.checked }))}
-              className="rounded"
+              className="rounded scale-90 accent-ocean-500 mt-0.5"
             />
-            <span className="text-[11px] text-slate-300">Only show annotated metabolites</span>
+            <span>
+              Only show annotated metabolites
+            </span>
           </label>
 
           <div className="flex items-center gap-2">
@@ -1833,6 +2646,27 @@ export default function MapPage({
             <p className="text-[11px] text-red-300">{metaboliteMatchesError}</p>
           )}
 
+          {metaboliteMatches.length > 0 && !metaboliteMatchesLoading && (
+            <div className="flex items-center justify-between bg-slate-950/30 border border-slate-800 rounded px-2 py-1.5">
+              <span className="text-[10px] text-slate-400">Intensity scale</span>
+              <div className="flex items-center gap-1">
+                {['log', 'linear'].map((mode) => (
+                  <button
+                    key={mode}
+                    onClick={() => setIntensityScale(mode)}
+                    className={`text-[10px] px-2 py-0.5 rounded border ${
+                      intensityScale === mode
+                        ? 'bg-ocean-700 border-ocean-600 text-white'
+                        : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-slate-100'
+                    }`}
+                  >
+                    {mode === 'log' ? 'Log10' : 'Linear'}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="text-[11px] text-slate-400">
             {metaboliteMatchesLoading ? 'Loading feature matches...' : `${metaboliteMatches.length.toLocaleString()} matching features`}
           </div>
@@ -1850,7 +2684,7 @@ export default function MapPage({
                   }`}
                 >
                   <button
-                    onClick={() => applyFeatureMapFilter(feature)}
+                    onClick={() => setSelectedFeature(feature)}
                     className="text-[11px] text-slate-200 font-semibold break-all text-left hover:text-ocean-400 hover:underline transition-colors w-full focus:outline-none"
                     title="Click to select metabolite and see present samples"
                   >
@@ -1859,7 +2693,16 @@ export default function MapPage({
                   <p className="text-[10px] text-slate-400 mt-1">
                     row ID: {feature.row_id} | m/z: {formatMz(feature.row_mz)} | RT: {formatRt(feature.row_retention_time)}
                   </p>
-                  <p className="text-[10px] text-slate-400">{feature.annotation ?? 'No annotation'} • {feature.sample_count} samples</p>
+                  <p className="text-[10px] text-slate-400">
+                    {feature.annotation ?? 'No annotation'}
+                    {' • '}
+                    {(() => {
+                      const detected = feature.detected_sample_count ?? feature.sample_count
+                      const total = feature.sample_count
+                      if (detected === total) return `${total.toLocaleString()} samples`
+                      return `found in ${detected.toLocaleString()} of ${total.toLocaleString()} samples`
+                    })()}
+                  </p>
                   
                   {isSelected && (
                     <div className="mt-2 pl-2 border-l-2 border-ocean-600 space-y-1">
@@ -1927,115 +2770,149 @@ export default function MapPage({
           {/* Dataset section - rendered specifically first at the top */}
           {filterCols.includes('_dataset') && (() => {
             const activeFilters = filters['_dataset'] ?? new Set()
+            // Dataset is the only section expanded by default.
+            const isCollapsed = collapsedSections['_dataset'] === true
             return (
               <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <p className="text-xs text-slate-400 font-medium">Dataset</p>
+                <button
+                  onClick={() => setCollapsedSections((prev) => ({ ...prev, _dataset: !isCollapsed }))}
+                  className="w-full flex items-center justify-between group"
+                >
+                  <span className="flex items-center gap-1 text-xs text-slate-400 font-medium group-hover:text-slate-200 transition-colors">
+                    {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                    Dataset
+                  </span>
                   {activeFilters.size > 0 && (
-                    <button onClick={() => clearFilter('_dataset')} className="text-xs text-ocean-400 hover:text-ocean-300">Clear</button>
+                    <span className="flex items-center gap-2">
+                      <span className="text-[10px] text-slate-500">{activeFilters.size} selected</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); clearFilter('_dataset') }}
+                        className="text-xs text-ocean-400 hover:text-ocean-300"
+                      >
+                        Clear
+                      </button>
+                    </span>
                   )}
-                </div>
-                <div className="max-h-32 overflow-y-auto space-y-0.5">
-                  {(columnValues['_dataset'] ?? []).map((v) => {
-                    const datasetInfo = (mapData?.datasets_details ?? []).find(
-                      (d) => String(d.name) === String(v)
-                    )
-                    return (
-                      <label key={v} className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer hover:bg-slate-800/30 p-1 rounded transition-colors">
-                        <input
-                          type="checkbox"
-                          checked={activeFilters.has(v)}
-                          onChange={() => toggleFilter('_dataset', v)}
-                          className="rounded mt-0.5"
-                        />
-                        <div className="flex flex-col min-w-0 flex-1">
-                          <span className="truncate font-medium text-slate-200" title={v}>{v}</span>
-                          {datasetInfo && (
-                            <span className="text-[10px] text-slate-400">
-                              {datasetInfo.n_samples?.toLocaleString() ?? 0} samples • {datasetInfo.n_features?.toLocaleString() ?? 0} features
-                            </span>
-                          )}
-                        </div>
-                      </label>
-                    )
-                  })}
-                </div>
+                </button>
+                {!isCollapsed && (
+                  <div className="max-h-32 overflow-y-auto space-y-0.5">
+                    {(columnValues['_dataset'] ?? []).map((v) => {
+                      const datasetInfo = (mapData?.datasets_details ?? []).find(
+                        (d) => String(d.name) === String(v)
+                      )
+                      return (
+                        <label key={v} className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer hover:bg-slate-800/30 p-1 rounded transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={activeFilters.has(v)}
+                            onChange={() => toggleFilter('_dataset', v)}
+                            className="rounded mt-0.5"
+                          />
+                          <div className="flex flex-col min-w-0 flex-1">
+                            <span className="truncate font-medium text-slate-200" title={v}>{v}</span>
+                            {datasetInfo && (
+                              <span className="text-[10px] text-slate-400">
+                                {(datasetPointCounts[datasetInfo.name] ?? datasetInfo.n_samples ?? 0).toLocaleString()} samples • {datasetInfo.n_features?.toLocaleString() ?? 0} features
+                              </span>
+                            )}
+                          </div>
+                        </label>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
             )
           })()}
 
           {/* Sample Specific search/filter listing (rendered specifically second at the top) */}
-          {mapData?.points && (
-            <div className="space-y-2 border-t border-slate-800 pt-3">
-              <div className="flex items-center justify-between">
-                <p className="text-xs text-slate-400 font-medium">Individual Samples</p>
-                {selectedSamples.size > 0 && (
-                  <button
-                    onClick={() => setSelectedSamples(new Set())}
-                    className="text-xs text-ocean-400 hover:text-ocean-300"
-                  >
-                    Clear ({selectedSamples.size})
-                  </button>
+          {mapData?.points && (() => {
+            // All non-Dataset sections default to collapsed.
+            const isCollapsed = collapsedSections['_samples'] !== false
+            return (
+              <div className="space-y-2 border-t border-slate-800 pt-3">
+                <button
+                  onClick={() => setCollapsedSections((prev) => ({ ...prev, '_samples': !isCollapsed }))}
+                  className="w-full flex items-center justify-between group"
+                >
+                  <span className="flex items-center gap-1 text-xs text-slate-400 font-medium group-hover:text-slate-200 transition-colors">
+                    {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                    Individual Samples
+                  </span>
+                  {selectedSamples.size > 0 && (
+                    <span className="flex items-center gap-2">
+                      <span className="text-[10px] text-slate-500">{selectedSamples.size} selected</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setSelectedSamples(new Set()) }}
+                        className="text-xs text-ocean-400 hover:text-ocean-300"
+                      >
+                        Clear
+                      </button>
+                    </span>
+                  )}
+                </button>
+                {!isCollapsed && (
+                  <>
+                    <input
+                      type="text"
+                      value={sampleSearch}
+                      onChange={(e) => setSampleSearch(e.target.value)}
+                      placeholder="Search sample filename..."
+                      className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-ocean-500"
+                    />
+                    <div className="max-h-40 overflow-y-auto space-y-1 pr-1 border border-slate-800 rounded p-1.5 bg-slate-950/20">
+                      {(() => {
+                        const query = sampleSearch.trim().toLowerCase()
+                        const filteredList = datasetScopedPoints.filter((p) => {
+                          const name = String(p._sample_id || p.index || p.filename || '')
+                          return !query || name.toLowerCase().includes(query)
+                        })
+
+                        if (filteredList.length === 0) {
+                          return <p className="text-[10px] text-slate-500 py-1 italic">No samples match search.</p>
+                        }
+
+                        return filteredList.map((p) => {
+                          const sampleId = String(p._sample_id || p.index || p.filename || '').trim()
+                          const datasetSafe = String(
+                            p._dataset_safe
+                            || mapData?.dataset_safe_map?.[String(p?._dataset ?? '')]
+                            || ''
+                          ).trim()
+                          const sampleKey = `${datasetSafe}::${sampleId}`
+                          const isChecked = selectedSamples.has(sampleKey)
+
+                          return (
+                            <div key={sampleKey} className="flex items-center gap-1 text-xs text-slate-300 py-0.5 border-b border-slate-800/40 last:border-0">
+                              <label className="flex items-center gap-2 cursor-pointer truncate min-w-0 flex-1">
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => {
+                                    setSelectedSamples((prev) => {
+                                      const next = new Set(prev)
+                                      if (next.has(sampleKey)) {
+                                        next.delete(sampleKey)
+                                      } else {
+                                        next.add(sampleKey)
+                                      }
+                                      return next
+                                    })
+                                  }}
+                                  className="rounded shrink-0"
+                                />
+                                <span className="truncate" title={sampleId}>{sampleId}</span>
+                              </label>
+                            </div>
+                          )
+                        })
+                      })()}
+                    </div>
+                  </>
                 )}
               </div>
-              <input
-                type="text"
-                value={sampleSearch}
-                onChange={(e) => setSampleSearch(e.target.value)}
-                placeholder="Search sample filename..."
-                className="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-ocean-500"
-              />
-              <div className="max-h-40 overflow-y-auto space-y-1 pr-1 border border-slate-800 rounded p-1.5 bg-slate-950/20">
-                {(() => {
-                  const query = sampleSearch.trim().toLowerCase()
-                  // Get points scoped by the currently selected dataset filters
-                  const filteredList = datasetScopedPoints.filter((p) => {
-                    const name = String(p._sample_id || p.index || p.filename || '')
-                    return !query || name.toLowerCase().includes(query)
-                  })
-
-                  if (filteredList.length === 0) {
-                    return <p className="text-[10px] text-slate-500 py-1 italic">No samples match search.</p>
-                  }
-
-                  return filteredList.map((p) => {
-                    const sampleId = String(p._sample_id || p.index || p.filename || '').trim()
-                    const datasetSafe = String(
-                      p._dataset_safe
-                      || mapData?.dataset_safe_map?.[String(p._dataset ?? '')]
-                      || ''
-                    ).trim()
-                    const sampleKey = `${datasetSafe}::${sampleId}`
-                    const isChecked = selectedSamples.has(sampleKey)
-
-                    return (
-                      <div key={sampleKey} className="flex items-center gap-1 text-xs text-slate-300 py-0.5 border-b border-slate-800/40 last:border-0">
-                        <label className="flex items-center gap-2 cursor-pointer truncate min-w-0 flex-1">
-                          <input
-                            type="checkbox"
-                            checked={isChecked}
-                            onChange={() => {
-                              setSelectedSamples((prev) => {
-                                const next = new Set(prev)
-                                if (next.has(sampleKey)) {
-                                  next.delete(sampleKey)
-                                } else {
-                                  next.add(sampleKey)
-                                }
-                                return next
-                              })
-                            }}
-                            className="rounded shrink-0"
-                          />
-                          <span className="truncate" title={sampleId}>{sampleId}</span>
-                        </label>
-                      </div>
-                    )
-                  })
-                })()}
-              </div>
-            </div>
-          )}
+            )
+          })()}
 
           {/* Filters per metadata column (rendered below the dataset & sample filter sections) */}
           {filterCols.map((col) => {
@@ -2044,27 +2921,45 @@ export default function MapPage({
             // Only render non-dataset and non-filename columns here; dataset and individual samples are already handled at the top
             if (col === '_dataset' || col.toLowerCase() === 'filename') return null;
 
+            // All non-Dataset sections default to collapsed.
+            const isCollapsed = collapsedSections[col] !== false
             return (
               <div key={col} className="space-y-1 border-t border-slate-800 pt-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-xs text-slate-400 font-medium">{col}</p>
+                <button
+                  onClick={() => setCollapsedSections((prev) => ({ ...prev, [col]: !isCollapsed }))}
+                  className="w-full flex items-center justify-between group"
+                >
+                  <span className="flex items-center gap-1 text-xs text-slate-400 font-medium group-hover:text-slate-200 transition-colors">
+                    {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                    {col}
+                  </span>
                   {activeFilters.size > 0 && (
-                    <button onClick={() => clearFilter(col)} className="text-xs text-ocean-400 hover:text-ocean-300">Clear</button>
+                    <span className="flex items-center gap-2">
+                      <span className="text-[10px] text-slate-500">{activeFilters.size} selected</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); clearFilter(col) }}
+                        className="text-xs text-ocean-400 hover:text-ocean-300"
+                      >
+                        Clear
+                      </button>
+                    </span>
                   )}
-                </div>
-                <div className="max-h-32 overflow-y-auto space-y-0.5">
-                  {(columnValues[col] ?? []).map((v) => (
-                    <label key={v} className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={activeFilters.has(v)}
-                        onChange={() => toggleFilter(col, v)}
-                        className="rounded"
-                      />
-                      <span className="truncate">{v}</span>
-                    </label>
-                  ))}
-                </div>
+                </button>
+                {!isCollapsed && (
+                  <div className="max-h-32 overflow-y-auto space-y-0.5">
+                    {(columnValues[col] ?? []).map((v) => (
+                      <label key={v} className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={activeFilters.has(v)}
+                          onChange={() => toggleFilter(col, v)}
+                          className="rounded"
+                        />
+                        <span className="truncate">{v}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
               </div>
             )
           })}
@@ -2083,7 +2978,7 @@ export default function MapPage({
       )}
 
       {/* Floating legend */}
-      {colorBy && columnValues[colorBy] && columnValues[colorBy].length > 0 && (
+      {(intensityInfo || (colorBy && columnValues[colorBy] && columnValues[colorBy].length > 0)) && (
         <div
           ref={legendRef}
           className="absolute z-20 w-72 bg-slate-900/95 border border-slate-700 rounded-xl shadow-xl"
@@ -2093,21 +2988,49 @@ export default function MapPage({
             onMouseDown={beginLegendDrag}
             className={`px-3 py-2 border-b border-slate-700 flex items-center justify-between cursor-move ${legendDragging ? 'select-none' : ''}`}
           >
-            <p className="text-xs text-slate-300 font-semibold">Legend ({colorBy})</p>
+            <p className="text-xs text-slate-300 font-semibold">
+              {intensityInfo ? `${intensityInfo.scale === 'log' ? 'Log10' : 'Linear'} Intensity: ${mapFeature?.metabolite ?? 'Metabolite'}` : 'Legend'}
+            </p>
             <span className="text-[10px] text-slate-500">drag</span>
           </div>
-          <div className="p-3 max-h-40 overflow-y-auto space-y-1">
-            {columnValues[colorBy].slice(0, 24).map((val) => {
-              const [r, g, b] = colorLookup.get(val) ?? strColor(val)
-              return (
-                <div key={val} className="flex items-center gap-2 text-xs text-slate-300">
-                  <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: `rgb(${r},${g},${b})` }} />
-                  <span className="truncate">{val}</span>
+          <div className="p-3">
+            {intensityInfo ? (
+              <div className="space-y-1.5">
+                <div
+                  className="h-4 w-full rounded"
+                  style={{ background: 'linear-gradient(to right, rgb(59,130,246), rgb(34,211,238), rgb(250,204,21), rgb(239,68,68))' }}
+                />
+                <div className="flex justify-between text-[10px] text-slate-400 font-mono">
+                  <span title={`Min intensity: ${intensityInfo.scale === 'log' ? Math.pow(10, intensityInfo.min).toExponential(2) : intensityInfo.min.toExponential(2)}`}>
+                    {intensityInfo.min.toFixed(2)}
+                  </span>
+                  <span title={`Max intensity: ${intensityInfo.scale === 'log' ? Math.pow(10, intensityInfo.max).toExponential(2) : intensityInfo.max.toExponential(2)}`}>
+                    {intensityInfo.max.toFixed(2)}
+                  </span>
                 </div>
-              )
-            })}
-            {columnValues[colorBy].length > 24 && (
-              <p className="text-xs text-slate-500">+{columnValues[colorBy].length - 24} more…</p>
+                <div className="flex items-center gap-2 text-[10px] text-slate-400">
+                  <span className="w-3 h-3 rounded-full shrink-0 bg-gray-500" />
+                  <span>Not detected (intensity = 0)</span>
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  Cool (low) → warm (high). Point size also scales with intensity.
+                </p>
+              </div>
+            ) : (
+              <div className="max-h-40 overflow-y-auto space-y-1">
+                {columnValues[colorBy].slice(0, 24).map((val) => {
+                  const [r, g, b] = colorLookup.get(val) ?? strColor(val)
+                  return (
+                    <div key={val} className="flex items-center gap-2 text-xs text-slate-300">
+                      <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: `rgb(${r},${g},${b})` }} />
+                      <span className="truncate">{val}</span>
+                    </div>
+                  )
+                })}
+                {columnValues[colorBy].length > 24 && (
+                  <p className="text-xs text-slate-500">+{columnValues[colorBy].length - 24} more…</p>
+                )}
+              </div>
             )}
           </div>
         </div>
@@ -2272,52 +3195,6 @@ export default function MapPage({
               )}
             </div>
           )}
-        </div>
-      )}
-
-      {/* Heatmap Overlay Modal */}
-      {heatmapOpen && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fade-in">
-          <div className="bg-slate-900 border border-slate-700 rounded-xl w-[32rem] max-w-full p-6 shadow-2xl flex flex-col gap-4 text-center">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <div className="flex items-center gap-2">
-                <Grid className="text-ocean-400 animate-pulse" size={18} />
-                <h3 className="font-semibold text-slate-200 text-sm tracking-wide">
-                  Dataset Intensity Heatmap
-                </h3>
-              </div>
-              <button
-                onClick={() => setHeatmapOpen(false)}
-                className="text-slate-500 hover:text-slate-300 transition-colors"
-              >
-                <X size={18} />
-              </button>
-            </div>
-
-            {/* Modal Content - Work in Progress Indicator */}
-            <div className="py-8 flex flex-col items-center justify-center gap-4">
-              <div className="w-14 h-14 rounded-full bg-ocean-950/50 border border-ocean-700/60 flex items-center justify-center text-ocean-400">
-                <RefreshCw size={24} className="animate-spin" />
-              </div>
-              <div className="space-y-1">
-                <h4 className="font-bold text-slate-200 text-sm">Feature in Progress</h4>
-                <p className="text-slate-400 text-xs max-w-sm leading-relaxed">
-                  The high-resolution hierarchical clustering heatmap calculations and visualizations are currently being optimized for large-scale marine dissolved organic matter datasets.
-                </p>
-              </div>
-            </div>
-
-            {/* Modal Footer */}
-            <div className="border-t border-slate-800 pt-3.5 flex justify-end">
-              <button
-                onClick={() => setHeatmapOpen(false)}
-                className="bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white rounded-lg px-4 py-1.5 text-xs font-semibold transition-colors"
-              >
-                Close
-              </button>
-            </div>
-          </div>
         </div>
       )}
     </div>

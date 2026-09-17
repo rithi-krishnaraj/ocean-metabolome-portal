@@ -4,21 +4,22 @@ Routes for manual upload, GNPS task loading, dataset management, and map data.
 """
 from __future__ import annotations
 
-import io
 import json
 import re
 import shutil
 import uuid
 from pathlib import Path
 from typing import Optional
-
+import skbio
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from data_processor import (
     clean_feature_table,
@@ -30,7 +31,15 @@ from data_processor import (
     remove_blank_features,
     validate_coordinates,
 )
-from gnps_client import load_cmn, load_fbmn
+from gnps_client import load_fbmn
+
+# Optional RDKit — enables SMILES → molecular formula fallback for Van Krevelen plots
+try:
+    from rdkit import Chem as _rd_Chem
+    from rdkit.Chem import rdMolDescriptors as _rd_md
+    _RDKIT_AVAILABLE = True
+except ImportError:
+    _RDKIT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -55,6 +64,25 @@ sessions: dict = {}
 # In-memory caches for blazingly fast performance
 DATASET_DF_CACHE = {}  # dataset_safe -> {"md": DataFrame, "ft": DataFrame, "mtime_md": float, "mtime_ft": float}
 PCOA_CACHE = {}        # (dataset_safe, distance_metric, sample_cols_tuple) -> {"evals": ndarray, "evecs": ndarray, "proportion_explained": list}
+
+def parse_feature_labels(columns):
+    """Parse feature labels formatted as ID_mz@RT.
+
+    Returns two lists (mz_values, rt_values) aligned with the input columns.
+    Entries that don't match the expected format are returned as None.
+    """
+    mz_values, rt_values = [], []
+    for col in columns:
+        try:
+            at_idx = col.index("@")
+            rt = float(col[at_idx + 1:])
+            mz = float(col[:at_idx].rsplit("_", 1)[1])
+            mz_values.append(mz)
+            rt_values.append(rt)
+        except (ValueError, IndexError):
+            mz_values.append(None)
+            rt_values.append(None)
+    return mz_values, rt_values
 
 
 def get_cached_dataset(dataset_safe: str, dataset_dir: Path):
@@ -82,9 +110,15 @@ def get_cached_dataset(dataset_safe: str, dataset_dir: Path):
     return md.copy(), ft.copy()
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _dataset_mtimes(dataset_dir: Path) -> tuple[float, float]:
+    """(md_mtime, ft_mtime) for cache invalidation — cheap stat() calls."""
+    md_path = dataset_dir / "md.parquet"
+    ft_path = dataset_dir / "ft.parquet"
+    return (
+        md_path.stat().st_mtime if md_path.exists() else 0.0,
+        ft_path.stat().st_mtime if ft_path.exists() else 0.0,
+    )
+
 
 def _df_records(df: Optional[pd.DataFrame], max_rows: int = 200) -> list:
     if df is None or df.empty:
@@ -276,9 +310,7 @@ async def upload_gnps(body: dict):
         raise HTTPException(400, "task_id is required.")
 
     try:
-        if workflow == "cmn":
-            ft, md, an = load_cmn(task_id)
-        else:
+        if workflow == "fbmn":
             ft, md, an = load_fbmn(task_id)
     except Exception as exc:
         raise HTTPException(400, f"Failed to load from GNPS: {exc}")
@@ -410,6 +442,7 @@ async def save_dataset(body: dict):
     if combined is not None and not combined.empty:
         combined.to_parquet(dataset_dir / "combined.parquet")
 
+
     meta = {
         "name": name,
         "safe_name": safe,
@@ -518,7 +551,6 @@ async def get_map_data():
 
         lat_col = _find_column_case_insensitive(md := pd.read_parquet(md_path), meta.get("lat_col"))
         lon_col = _find_column_case_insensitive(md, meta.get("lon_col"))
-
         if not lat_col or not lon_col:
             # Skip malformed coordinate metadata instead of crashing the whole map payload.
             continue
@@ -535,11 +567,11 @@ async def get_map_data():
             md["_sample_id"] = np.where(pd.Series(index_ids).str.strip().ne(""), index_ids, fallback_ids)
         md["_lat"] = pd.to_numeric(md[lat_col], errors="coerce")
         md["_lon"] = pd.to_numeric(md[lon_col], errors="coerce")
-        
+
         # Ensure the filename (first column of metadata) is included as a regular column
         filename_col = md.index.name or "filename"
         md[filename_col] = md.index.astype(str)
-        
+
         md = md.dropna(subset=["_lat", "_lon"])
 
         if md.empty:
@@ -686,12 +718,14 @@ async def get_metabolite_features(body: dict):
                 continue
 
             present_samples = []
+            detected_count = 0
             for sample_col in sample_cols:
                 intensity = row[sample_col]
                 if pd.isna(intensity):
                     continue
                 try:
-                    if float(intensity) <= 0:
+                    intensity_num = float(intensity)
+                    if intensity_num < 0:
                         continue
                 except Exception:
                     continue
@@ -710,8 +744,11 @@ async def get_metabolite_features(body: dict):
                         "sample_id": str(sample_col),
                         "lat": float(lat_val),
                         "lon": float(lon_val),
+                        "intensity": intensity_num,
                     }
                 )
+                if intensity_num > 0:
+                    detected_count += 1
 
             if not present_samples:
                 continue
@@ -724,6 +761,7 @@ async def get_metabolite_features(body: dict):
                     "row_retention_time": parsed_rt,
                     "annotation": annotation_name or None,
                     "sample_count": len(present_samples),
+                    "detected_sample_count": detected_count,
                     "dataset": dataset_name,
                     "dataset_safe": dataset_safe,
                     "present_samples": present_samples,
@@ -810,7 +848,7 @@ async def get_map_sample_details(
         str(k): ("N/A" if pd.isna(sample_dict.get(k)) else str(sample_dict.get(k)))
         for k in keys_to_return
     }
-    
+
     # Always guarantee the original filename column is explicitly in the metadata list
     filename_col = md.index.name or "filename"
     metadata[str(filename_col)] = str(matched_sample_id)
@@ -904,19 +942,19 @@ async def get_dataset_metadata_schema(safe_name: str):
     md_path = dataset_dir / "md.parquet"
     if not md_path.exists():
         return {"columns": [], "categories": {}, "samples": []}
-        
+
     md, _ = get_cached_dataset(safe_name, dataset_dir)
     if md is None:
         raise HTTPException(400, "Dataset files missing")
-        
+
     md.index = md.index.astype(str)
     metadata_cols = sorted([c for c in md.columns if not c.startswith('_')])
-    
+
     categories = {}
     for col in metadata_cols:
         cats = sorted([str(x) for x in md[col].dropna().unique() if str(x).strip() != ''])
         categories[col] = cats
-        
+
     # Build a lightweight list of all samples and their relevant metadata
     samples_list = []
     for idx, row in md.iterrows():
@@ -927,11 +965,100 @@ async def get_dataset_metadata_schema(safe_name: str):
             val = row.get(col)
             sample_data[col] = "N/A" if pd.isna(val) else str(val)
         samples_list.append(sample_data)
-        
+
     return {
         "columns": metadata_cols,
         "categories": categories,
         "samples": samples_list
+    }
+
+
+@app.get("/api/datasets/{safe_name}/metabolites")
+async def get_dataset_metabolites(safe_name: str):
+    dataset_dir = DATASETS_DIR / safe_name
+    if not dataset_dir.exists():
+        raise HTTPException(404, "Dataset not found")
+
+    ft_path = dataset_dir / "ft.parquet"
+    if not ft_path.exists():
+        raise HTTPException(404, "Feature table missing")
+
+    ft = pd.read_parquet(ft_path)
+
+    # Calculate max intensity for each metabolite for sorting
+    # Use max() as it represents the highest detection signal
+    metas = []
+    for idx, row in ft.iterrows():
+        metas.append({
+            "id": str(idx),
+            "max_intensity": float(row.max())
+        })
+
+    # Sort by max intensity descending
+    metas.sort(key=lambda x: x["max_intensity"], reverse=True)
+
+    return {"metabolites": metas}
+
+
+@app.post("/api/datasets/{safe_name}/boxplot-data")
+async def get_boxplot_data(safe_name: str, body: dict):
+    metabolite = body.get("metabolite")
+    samples = body.get("samples", [])
+
+    if not metabolite:
+        raise HTTPException(400, "Metabolite ID is required")
+
+    dataset_dir = DATASETS_DIR / safe_name
+    if not dataset_dir.exists():
+        raise HTTPException(404, "Dataset not found")
+
+    ft_path = dataset_dir / "ft.parquet"
+    md_path = dataset_dir / "md.parquet"
+
+    if not ft_path.exists() or not md_path.exists():
+        raise HTTPException(404, "Dataset files missing")
+
+    ft = pd.read_parquet(ft_path)
+    md = pd.read_parquet(md_path)
+
+    if metabolite not in ft.index:
+        # Try fuzzy match if exact fails (e.g. string vs int index)
+        ft.index = ft.index.astype(str)
+        if str(metabolite) not in ft.index:
+            raise HTTPException(404, f"Metabolite '{metabolite}' not found in dataset")
+        metabolite = str(metabolite)
+
+    # Get intensities for the metabolite
+    row = ft.loc[metabolite]
+
+    # If samples are provided, filter by them
+    if samples:
+        # Ensure sample IDs are strings and exist in columns
+        samples = [str(s) for s in samples]
+        available_samples = [s for s in samples if s in row.index]
+        intensities = row[available_samples]
+    else:
+        intensities = row
+
+    # Prepare data for boxplot: list of {sample: ID, intensity: VAL, metadata: ...}
+    plot_data = []
+    for sample_id, val in intensities.items():
+        if pd.isna(val):
+            continue
+
+        sample_meta = {}
+        if sample_id in md.index:
+            sample_meta = md.loc[sample_id].to_dict()
+
+        plot_data.append({
+            "sample_id": str(sample_id),
+            "intensity": float(val),
+            "metadata": {str(k): str(v) for k, v in sample_meta.items() if not str(k).startswith('_')}
+        })
+
+    return {
+        "metabolite": metabolite,
+        "data": plot_data
     }
 
 
@@ -973,7 +1100,7 @@ async def run_map_pcoa(body: dict):
     # Get inputs
     distance_metric = body.get("distance_metric", "braycurtis")
     attribute = body.get("attribute") or (metadata_cols[0] if metadata_cols else None)
-    
+
     # Selected categories to filter on
     selected_categories = body.get("categories")
     selected_samples = body.get("samples")
@@ -990,12 +1117,14 @@ async def run_map_pcoa(body: dict):
         filtered_md = filtered_md[filtered_md[attribute].notna()]
         if selected_categories is not None:
             filtered_md = filtered_md[filtered_md[attribute].astype(str).isin(selected_categories)]
-    
+
+    # Use the sample mapping logic to ensure robust sample ID matching
     if selected_samples is not None:
-        filtered_md = filtered_md[filtered_md.index.isin(selected_samples)]
+        # Match selected_samples against the resolved _sample_id
+        filtered_md = filtered_md[filtered_md["_sample_id"].isin(selected_samples)]
 
     sample_cols = [c for c in ft.columns if c in filtered_md.index]
-    
+
     if len(sample_cols) < 2:
         return {
             "all_sample_ids": all_sample_ids,
@@ -1009,75 +1138,122 @@ async def run_map_pcoa(body: dict):
     # Filter out features with all zeros (to avoid zero variance/distance issues)
     X_df = X_df.loc[:, (X_df != 0).any(axis=0)]
 
+    # Sort index to match FBMN-STATS-Webapp behavior exactly
+    X_df.sort_index(inplace=True)
+
+    perm_md = filtered_md[filtered_md[color_by].notna()].copy()
+    perm_md.sort_index(inplace=True)
+
+    n_unique = perm_md[color_by].nunique()
+    min_per_cat = perm_md[color_by].value_counts().min() if n_unique > 0 else 0
+    can_permanova = n_unique >= 2 and min_per_cat >= 2
+
     # Check PCoA Eigendecomposition and Distance Matrix Cache
-    cache_key = (dataset_safe, distance_metric, tuple(sorted(sample_cols)))
-    cached_pcoa = PCOA_CACHE.get(cache_key)
+    # We must sort sample_cols here to ensure cache key matches
+    sorted_samples = tuple(X_df.index)
+    cache_key = (dataset_safe, distance_metric, sorted_samples)
+    pcoa = PCOA_CACHE.get(cache_key)
 
-    if cached_pcoa is not None:
-        evals = cached_pcoa["evals"]
-        evecs = cached_pcoa["evecs"]
-        proportion_explained = cached_pcoa["proportion_explained"]
-    else:
-        try:
-            from scipy.spatial import distance as scipy_distance
-            # Compute distance matrix
-            d_vals = scipy_distance.pdist(X_df.values, metric=distance_metric)
-            D = scipy_distance.squareform(d_vals)
-        except Exception as e:
-            return {
-                "all_sample_ids": all_sample_ids,
-                "metadata_columns": metadata_cols,
-                "all_categories": all_categories,
-                "error": f"Failed to compute distance matrix using metric '{distance_metric}': {str(e)}"
-            }
+    permanova_df = None
 
-        # PCoA (Classical MDS)
-        n = D.shape[0]
-        H = np.eye(n) - np.ones((n, n)) / n
-        B = -0.5 * (H @ (D ** 2) @ H)
+    try:
+        from scipy.spatial import distance as scipy_distance
+        # Compute distance matrix
+        d_vals = scipy_distance.pdist(X_df.values, metric=distance_metric)
+        D = scipy_distance.squareform(d_vals)
+        distance_matrix = skbio.stats.distance.DistanceMatrix(
+            D,
+            ids=X_df.index,
+        )
 
-        try:
-            evals, evecs = np.linalg.eigh(B)
-            # Sort descending
-            idx = np.argsort(evals)[::-1]
-            evals = evals[idx]
-            evecs = evecs[:, idx]
+        if pcoa is None:
+            pcoa = skbio.stats.ordination.pcoa(distance_matrix)
+            PCOA_CACHE[cache_key] = pcoa
 
-            # Proportion explained
-            pos_evals = np.clip(evals, 0, None)
-            sum_pos_evals = np.sum(pos_evals)
-            proportion_explained = []
-            top_k = min(10, n)
-            for k in range(top_k):
-                prop = (pos_evals[k] / sum_pos_evals) if sum_pos_evals > 0 else 0.0
-                proportion_explained.append(float(prop))
-                
-            PCOA_CACHE[cache_key] = {
-                "evals": evals,
-                "evecs": evecs,
-                "proportion_explained": proportion_explained
-            }
-        except Exception as e:
-             return {
-                "all_sample_ids": all_sample_ids,
-                "metadata_columns": metadata_cols,
-                "all_categories": all_categories,
-                "error": f"Failed to perform eigendecomposition for PCoA: {str(e)}"
-            }
+        if can_permanova:
+            permanova_groups = perm_md.loc[X_df.index, color_by]
+            permanova = skbio.stats.distance.permanova(distance_matrix, permanova_groups)
+            permanova["R2"] = 1 - 1 / (1 + permanova["test statistic"] * permanova["number of groups"] / (permanova["sample size"] - permanova["number of groups"] - 1))
+            permanova_res = permanova.to_frame(name="PERMANOVA results").reset_index()
+            permanova_res.columns = ["Metric", "Value"]
+            permanova_res["Value"] = permanova_res["Value"].apply(lambda x: str(x) if not isinstance(x, (int, float)) else x)
+            permanova_df = permanova_res.to_dict(orient="records")
+
+    except Exception as e:
+        return {
+            "all_sample_ids": all_sample_ids,
+            "metadata_columns": metadata_cols,
+            "all_categories": all_categories,
+            "error": f"Failed to compute PCoA or PERMANOVA: {str(e)}"
+        }
 
     n = len(sample_cols)
     top_k = min(10, n)
-    coordinates = {}
-    for i, sample_id in enumerate(sample_cols):
-        coordinates[sample_id] = {}
-        for k in range(top_k):
-            ev = evals[k]
-            val = evecs[i, k] * np.sqrt(ev) if ev > 0 else 0.0
-            coordinates[sample_id][f"PC{k+1}"] = float(val)
+
+    pcoa_x_axis = body.get("x_axis", "PC1")
+    pcoa_y_axis = body.get("y_axis", "PC2")
+
+    df = pcoa.samples[[pcoa_x_axis, pcoa_y_axis]].copy()
+
+    cols_to_merge = [color_by]
+    if attribute and attribute != color_by:
+        cols_to_merge.append(attribute)
+
+    df = pd.merge(
+        df,
+        filtered_md[cols_to_merge].apply(lambda c: c.apply(str)),
+        left_index=True,
+        right_index=True,
+    )
+
+    symbol_col = attribute if attribute else color_by
+
+    fig_scatter = px.scatter(
+        df,
+        x=pcoa_x_axis,
+        y=pcoa_y_axis,
+        template="plotly_dark",
+        color=color_by,
+        symbol=symbol_col,
+        hover_name=df.index,
+    )
+
+    x_expl = pcoa.proportion_explained.iloc[int(pcoa_x_axis[2:]) - 1] * 100
+    y_expl = pcoa.proportion_explained.iloc[int(pcoa_y_axis[2:]) - 1] * 100
+
+    fig_scatter.update_layout(
+        font={"color": "grey", "size": 12, "family": "Sans"},
+        title={"text": "PRINCIPAL COORDINATE ANALYSIS", "font_color": "#ffffff"},
+        xaxis_title=f"{pcoa_x_axis} ({round(x_expl, 1)}%)",
+        yaxis_title=f"{pcoa_y_axis} ({round(y_expl, 1)}%)",
+        autosize=True,
+        margin=dict(l=40, r=40, t=40, b=40),
+        yaxis=dict(
+            scaleanchor="x",
+            scaleratio=1
+        )
+    )
+
+    percent_variance = np.round(pcoa.proportion_explained[:10] * 100, decimals=2)
+    fig_var = px.bar(
+        x=pcoa.samples.columns[:10],
+        y=percent_variance,
+        template="plotly_dark",
+    )
+    fig_var.update_traces(marker_color="#696880", width=0.5)
+    fig_var.update_layout(
+        font={"color": "grey", "size": 12, "family": "Sans"},
+        title={"text": "PCoA - VARIANCE", "x": 0.5, "font_color": "#ffffff"},
+        xaxis_title="principal component",
+        yaxis_title="variance (%)",
+        autosize=True,
+        margin=dict(l=40, r=40, t=40, b=40)
+    )
 
     # Prepare sample details for coordinates
     coordinate_details = []
     for s_id in sample_cols:
+        row_coords = pcoa.samples.loc[s_id].to_dict()
         row_md = filtered_md.loc[s_id]
         color_val = str(row_md.get(color_by, "N/A")) if color_by else "N/A"
         shape_val = str(row_md.get(attribute, "N/A")) if attribute else "N/A"
@@ -1085,98 +1261,565 @@ async def run_map_pcoa(body: dict):
             "sample_id": s_id,
             "color_value": color_val,
             "shape_value": shape_val,
-            "coordinates": coordinates[s_id]
+            "coordinates": {f"PC{k+1}": float(row_coords.get(f"PC{k+1}", 0.0)) for k in range(top_k)}
         })
+
+    # Replace NaN values with "N/A" for JSON serialization compliance
+    filtered_metadata_records = filtered_md.reset_index().fillna("N/A").to_dict(orient="records")
 
     return {
         "all_sample_ids": all_sample_ids,
         "metadata_columns": metadata_cols,
         "all_categories": all_categories,
         "coordinates": coordinate_details,
-        "proportion_explained": proportion_explained,
-        "filtered_metadata": filtered_md.reset_index().to_dict(orient="records")
+        "scatter_plot": json.loads(fig_scatter.to_json()),
+        "variance_plot": json.loads(fig_var.to_json()),
+        "proportion_explained": pcoa.proportion_explained.tolist(),
+        "permanova": permanova_df,
+        "filtered_metadata": filtered_metadata_records
     }
 
 
-@app.get("/api/datasets/{safe_name}/heatmap")
-async def get_dataset_heatmap(safe_name: str):
+def _formula_from_inchi(inchi: str) -> Optional[str]:
+    """Extract the molecular formula layer from an InChI string."""
+    if not isinstance(inchi, str):
+        return None
+    iv = inchi.strip()
+    if iv.startswith("InChI=") and "/" in iv:
+        parts = iv.split("/")
+        if len(parts) >= 2 and parts[1].strip():
+            return parts[1].strip()
+    return None
+
+
+def _formula_from_smiles(smiles: str) -> Optional[str]:
+    """Convert a SMILES string to a molecular formula (requires RDKit)."""
+    if not _RDKIT_AVAILABLE or not isinstance(smiles, str):
+        return None
+    smi = smiles.strip()
+    if not smi or smi.lower() == "nan":
+        return None
+    try:
+        mol = _rd_Chem.MolFromSmiles(smi)
+        if mol is None:
+            return None
+        return _rd_md.CalcMolFormula(mol)
+    except Exception:
+        return None
+
+
+def _resolve_row_formula(row, formula_col=None, inchi_col=None, smiles_col=None) -> tuple[str, str]:
+    """Resolve (molecular_formula, source) for one annotation row.
+
+    Priority: explicit formula column (SIRIUS/ZODIAC or library match) → InChI → SMILES.
+    Returns ("", "") when nothing usable is found.
+    """
+    if formula_col and formula_col in row.index:
+        val = row[formula_col]
+        if not pd.isna(val):
+            f = str(val).strip()
+            if f and f.lower() != "nan":
+                return f, "sirius_or_library"
+    if inchi_col and inchi_col in row.index:
+        f = _formula_from_inchi(str(row[inchi_col]))
+        if f:
+            return f, "inchi"
+    if smiles_col and smiles_col in row.index:
+        f = _formula_from_smiles(str(row[smiles_col]))
+        if f:
+            return f, "smiles"
+    return "", ""
+
+
+def _get_annotated_scans(
+    an: pd.DataFrame,
+    scan_col: Optional[str],
+    formula_col: Optional[str],
+    include_msbuddy: bool = False,
+) -> set:
+    """Return normalized scan IDs that carry a molecular formula from ANY source.
+
+    Sources: formula column (SIRIUS/ZODIAC/library), InChI, SMILES (with RDKit).
+    MSBuddy-predicted rows are excluded unless include_msbuddy=True.
+    """
+    if an.empty or not scan_col or scan_col not in an.columns:
+        return set()
+
+    inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
+    smiles_col = next((c for c in an.columns if c.lower() in ("smiles", "smile")), None)
+
+    has_formula = pd.Series(False, index=an.index)
+    if formula_col and formula_col in an.columns:
+        s = an[formula_col].astype(str).str.strip()
+        has_formula |= an[formula_col].notna() & s.ne("") & s.str.lower().ne("nan")
+    if inchi_col:
+        s = an[inchi_col].astype(str).str.strip()
+        has_formula |= s.str.startswith("InChI=") & s.str.contains("/") & s.str.split("/").str[1].str.strip().ne("")
+    if smiles_col and _RDKIT_AVAILABLE:
+        s = an[smiles_col].astype(str).str.strip()
+        has_formula |= s.ne("") & s.str.lower().ne("nan")
+
+    if not include_msbuddy:
+        if "SpectrumID" in an.columns:
+            has_formula &= ~an["SpectrumID"].astype(str).str.startswith("MSB_")
+        if "Compound_Name" in an.columns:
+            has_formula &= ~an["Compound_Name"].astype(str).str.startswith("MSBuddy:")
+
+    scans = set()
+    for sid in an.loc[has_formula, scan_col].astype(str).values:
+        if sid.endswith(".0"):
+            sid = sid[:-2]
+        scans.add(sid)
+    return scans
+
+
+def calculate_ratios_from_formula(formula: str) -> tuple[Optional[float], Optional[float]]:
+    if not isinstance(formula, str) or not formula or pd.isna(formula):
+        return None, None
+    pattern = r'([A-Z][a-z]*)(\d*)'
+    matches = re.findall(pattern, formula)
+    
+    counts = {}
+    for elem, count_str in matches:
+        count = int(count_str) if count_str else 1
+        counts[elem] = counts.get(elem, 0) + count
+        
+    c = counts.get('C', 0)
+    h = counts.get('H', 0)
+    o = counts.get('O', 0)
+    
+    if c == 0:
+        return None, None
+        
+    return o / c, h / c
+
+
+def calculate_carbon_oxidation_state(formula: str) -> Optional[float]:
+    """Calculate Carbon Oxidation State (COS) from molecular formula.
+    
+    COS = (2*O + N - H) / C
+    
+    Returns COS value or None if formula is invalid.
+    """
+    if not isinstance(formula, str) or not formula or pd.isna(formula):
+        return None
+    pattern = r'([A-Z][a-z]*)(\d*)'
+    matches = re.findall(pattern, formula)
+    
+    counts = {}
+    for elem, count_str in matches:
+        count = int(count_str) if count_str else 1
+        counts[elem] = counts.get(elem, 0) + count
+        
+    c = counts.get('C', 0)
+    if c == 0:
+        return None
+    
+    o = counts.get('O', 0)
+    n = counts.get('N', 0)
+    h = counts.get('H', 0)
+    
+    return (2 * o + n - h) / c
+
+
+def classify_by_formula_ratios(formula: str, o_c: float, h_c: float) -> str:
+    pattern = r'([A-Z][a-z]*)(\d*)'
+    matches = re.findall(pattern, formula)
+    counts = {}
+    for elem, count_str in matches:
+        count = int(count_str) if count_str else 1
+        counts[elem] = counts.get(elem, 0) + count
+        
+    n = counts.get('N', 0)
+    
+    if o_c < 0.3 and h_c >= 1.5:
+        return "Lipids"
+    elif 0.3 <= o_c <= 0.6 and 1.5 <= h_c <= 2.2 and n > 0:
+        return "Amino Acids / Peptides"
+    elif o_c >= 0.6 and h_c >= 1.5:
+        return "Carbohydrates"
+    elif o_c <= 0.1 and h_c < 0.5:
+        return "Condensed Aromatics"
+    elif 0.1 < o_c < 0.6 and 0.5 <= h_c <= 1.5:
+        return "Lignins"
+    elif o_c < 0.1 and 1.0 <= h_c < 1.5:
+        return "Unsaturated Hydrocarbons"
+    elif n > 0:
+        return "Alkaloids / Organonitrogen"
+    else:
+        return "Aliphatic Organics"
+
+
+def apply_fdr_correction(p_values: list[float]) -> list[float]:
+    """Apply Benjamini-Hochberg FDR correction."""
+    n = len(p_values)
+    if n == 0: return []
+    indexed_ps = sorted(enumerate(p_values), key=lambda x: x[1])
+    adj_ps = [0] * n
+    prev_adj_p = 1.0
+    for i in range(n - 1, -1, -1):
+        idx, p = indexed_ps[i]
+        adj_p = min(prev_adj_p, p * n / (i + 1))
+        adj_ps[idx] = adj_p
+        prev_adj_p = adj_p
+    return adj_ps
+
+
+@app.get("/api/datasets/{safe_name}/vankrevelen")
+async def get_dataset_vankrevelen(
+    safe_name: str,
+    show_msbuddy: bool = False
+):
     dataset_dir = DATASETS_DIR / safe_name
     if not dataset_dir.exists():
-        raise HTTPException(404, "Dataset not found")
+        raise HTTPException(404, f"Dataset {safe_name} not found")
 
-    md, ft = get_cached_dataset(safe_name, dataset_dir)
-    if md is None or ft is None:
-        raise HTTPException(400, "Dataset files missing")
+    an_path = dataset_dir / "an.parquet"
+    ft_path = dataset_dir / "ft.parquet"
+    md_path = dataset_dir / "md.parquet"
+    meta_path = dataset_dir / "meta.json"
 
-    md.index = md.index.astype(str)
+    if not an_path.exists() or not ft_path.exists():
+        return {
+            "points": [], "total_points": 0, "message": "Required files missing.",
+            "unannotated_significant_count": 0, "total_features": 0
+        }
+
+    an = pd.read_parquet(an_path)
+    ft = pd.read_parquet(ft_path)
+    md = pd.read_parquet(md_path) if md_path.exists() else pd.DataFrame()
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+    if ft.empty:
+        return {"points": [], "total_points": 0, "total_features": 0}
+
+    scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
+    formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
+    inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
+    smiles_col = next((c for c in an.columns if c.lower() in ("smiles", "smile")), None)
+
+    # Scans carrying a formula from ANY source (SIRIUS/ZODIAC, library match, InChI, SMILES)
+    annotated_scans = _get_annotated_scans(an, scan_col, formula_col, include_msbuddy=show_msbuddy)
+
+    ft.index = ft.index.astype(str)
+    ft.columns = [str(c) for c in ft.columns]
+
+    # Isolate sample data from background blanks and control solutions
+    blank_samples = set()
+    if not md.empty:
+        for col in md.columns:
+            try:
+                series_str = md[col].astype(str).str.lower()
+                matches = md.index[series_str.str.contains("blank|control|qc|solvent|media", regex=True)]
+                blank_samples.update(matches.astype(str))
+            except Exception: continue
+    bio_samples_idx = md.index.difference(blank_samples)
+    bio_samples = [c for c in ft.columns if c in bio_samples_idx]
+    if not bio_samples: bio_samples = list(ft.columns)
+
+    # Pre-extract and normalize row IDs
+    f_keys = ft.index.values
+    rids = [str(k).split("_")[0] for k in f_keys]
+    rids = [rid[:-2] if rid.endswith(".0") else rid for rid in rids]
+
+    # Create true biological annotated mask
+    is_annotated = np.array([rid in annotated_scans for rid in rids])
+    ft_filtered = ft.loc[is_annotated]
+
+    # Vectorized mean calculation over bio_samples (instantaneous in pandas!)
+    if not ft_filtered.empty and bio_samples:
+        mean_intensities = ft_filtered[bio_samples].mean(axis=1).fillna(0.0).to_dict()
+    else:
+        mean_intensities = {}
+
+    # Gather features with non-zero pre-computed mean intensities
+    sirius_features = [(f_key, mean_intensities.get(f_key, 0.0)) for f_key in ft_filtered.index]
+
+    # Sort descending by mean intensity/abundance and slice the top 1000
+    sirius_features.sort(key=lambda x: x[1], reverse=True)
+    top_keys = [item[0] for item in sirius_features[:1000]]
+
+    row_id_to_full = {}
+    for k in top_keys:
+        rid = str(k).split("_")[0]
+        if rid.endswith(".0"): rid = rid[:-2]
+        row_id_to_full[rid] = k
+
+    # Pre-filter 'an' rows vectorially for maximum loop efficiency
+    an_scans_str = an[scan_col].astype(str).values if scan_col else []
+    normalized_scans = [s[:-2] if s.endswith(".0") else s for s in an_scans_str]
+    unique_row_ids_to_keep = set(row_id_to_full.keys())
+
+    an_keep_mask = np.array([s in unique_row_ids_to_keep for s in normalized_scans])
+    an_subset = an.loc[an_keep_mask]
+
+    points = []
+    name_col = next((c for c in ["Compound_Name", "compound_name", "name", "Name"] if c in an.columns), None)
+
+    for _, row in an_subset.iterrows():
+        rid = str(row[scan_col]) if scan_col else ""
+        if rid.endswith(".0"): rid = rid[:-2]
+        if rid not in row_id_to_full: continue
+        f_key = row_id_to_full[rid]
+        is_msbuddy = str(row.get("SpectrumID", "")).startswith("MSB_") or str(row.get("Compound_Name", "")).startswith("MSBuddy:")
+        if is_msbuddy and not show_msbuddy:
+            continue
+
+        formula, formula_source = _resolve_row_formula(row, formula_col, inchi_col, smiles_col)
+        if not formula: continue
+        o_c, h_c = calculate_ratios_from_formula(formula)
+        if o_c is None or h_c is None: continue
+
+        points.append({
+            "metabolite": f_key, "row_id": rid, "formula": formula, "o_c": o_c, "h_c": h_c,
+            "formula_source": "msbuddy" if is_msbuddy else formula_source,
+            "compound_name": str(row[name_col]) if name_col and not pd.isna(row[name_col]) else "",
+            "intensity": mean_intensities.get(f_key, 1.0),
+            "superclass": str(row.get("superclass", "Unclassified")),
+            "class": str(row.get("class", "Unclassified")),
+            "subclass": str(row.get("subclass", "Unclassified")),
+            "npclassifier_superclass": str(row.get("npclassifier_superclass", "Unclassified")),
+            "npclassifier_class": str(row.get("npclassifier_class", "Unclassified")),
+            "npclassifier_pathway": str(row.get("npclassifier_pathway", "Unclassified"))
+        })
+
+    return {
+        "points": points, "total_points": len(points),
+        "unannotated_significant_count": 0,
+        "total_features": int(ft.shape[0]),
+        "annotated_features": int(is_annotated.sum()),
+        "msbuddy_included": bool(show_msbuddy),
+    }
+
+
+@app.get("/api/datasets/{safe_name}/carbon-ox-state")
+async def get_dataset_carbon_ox_state(safe_name: str, show_msbuddy: bool = False):
+    """
+    Get Carbon Oxidation State (COS) data for annotated features.
+
+    Returns top features by intensity with COS values and classification.
+    """
+    dataset_dir = DATASETS_DIR / safe_name
+    if not dataset_dir.exists():
+        raise HTTPException(404, f"Dataset {safe_name} not found")
+
+    an_path = dataset_dir / "an.parquet"
+    ft_path = dataset_dir / "ft.parquet"
+    md_path = dataset_dir / "md.parquet"
+    meta_path = dataset_dir / "meta.json"
+
+    if not an_path.exists() or not ft_path.exists():
+        return {
+            "points": [], "total_points": 0, "message": "Required files missing.",
+            "total_features": 0
+        }
+
+    an = pd.read_parquet(an_path)
+    ft = pd.read_parquet(ft_path)
+    md = pd.read_parquet(md_path) if md_path.exists() else pd.DataFrame()
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+    if ft.empty:
+        return {"points": [], "total_points": 0, "total_features": 0}
+
+    scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
+    formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
+    inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
+    smiles_col = next((c for c in an.columns if c.lower() in ("smiles", "smile")), None)
+
+    # Scans carrying a formula from ANY source (SIRIUS/ZODIAC, library match, InChI, SMILES)
+    annotated_scans = _get_annotated_scans(an, scan_col, formula_col, include_msbuddy=show_msbuddy)
+
+    ft.index = ft.index.astype(str)
     ft.columns = [str(c) for c in ft.columns]
     ft.index = ft.index.astype(str)
 
-    sample_cols = [c for c in ft.columns if c in md.index]
-    if len(sample_cols) < 2 or ft.shape[0] < 2:
-        return {
-            "samples": sample_cols,
-            "features": list(ft.index),
-            "values": []
-        }
+    # Isolate biological samples from blanks/controls
+    blank_samples = set()
+    if not md.empty:
+        for col in md.columns:
+            try:
+                series_str = md[col].astype(str).str.lower()
+                matches = md.index[series_str.str.contains("blank|control|qc|solvent|media", regex=True)]
+                blank_samples.update(matches.astype(str))
+            except Exception: continue
+    bio_samples_idx = md.index.difference(blank_samples)
+    bio_samples = [c for c in ft.columns if c in bio_samples_idx]
+    if not bio_samples: bio_samples = list(ft.columns)
 
-    # Limit to top 200 features for optimal UI performance
-    # Filter features based on variance (highest standard deviation across samples)
-    std_devs = ft[sample_cols].std(axis=1).fillna(0.0)
-    top_indices = std_devs.nlargest(200).index
-    ft_sub = ft.loc[top_indices, sample_cols].fillna(0.0)
+    # Pre-extract and normalize row IDs
+    f_keys = ft.index.values
+    rids = [str(k).split("_")[0] for k in f_keys]
+    rids = [rid[:-2] if rid.endswith(".0") else rid for rid in rids]
 
-    # Convert values to log scale log10(x + 1)
-    ft_sub_log = np.log10(ft_sub + 1)
+    # Filter for annotated features
+    is_annotated = np.array([rid in annotated_scans for rid in rids])
+    ft_filtered = ft.loc[is_annotated]
 
-    try:
-        from scipy.cluster.hierarchy import linkage, dendrogram
-        # Perform hierarchical clustering on features
-        link_ft = linkage(ft_sub_log.values, method="complete", metric="euclidean")
-        dend_ft = dendrogram(link_ft, no_plot=True)
-        ordered_features = [str(ft_sub.index[i]) for i in dend_ft["leaves"]]
-        
-        # Perform hierarchical clustering on samples
-        link_samples = linkage(ft_sub_log.values.T, method="complete", metric="euclidean")
-        dend_samples = dendrogram(link_samples, no_plot=True)
-        ordered_samples = [str(sample_cols[i]) for i in dend_samples["leaves"]]
-    except Exception:
-        # Fallback to standard sorted indices if linkage fails
-        ordered_features = list(ft_sub.index)
-        ordered_samples = sample_cols
+    # Calculate mean intensities over biological samples
+    if not ft_filtered.empty and bio_samples:
+        mean_intensities = ft_filtered[bio_samples].mean(axis=1).fillna(0.0).to_dict()
+    else:
+        mean_intensities = {}
 
-    # Reorder DataFrame
-    ft_reordered = ft_sub.loc[ordered_features, ordered_samples]
+    # Gather features with non-zero mean intensities
+    sirius_features = [(f_key, mean_intensities.get(f_key, 0.0)) for f_key in ft_filtered.index]
 
-    # Normalize reordered data to 0..1 globally for fast rendering
-    vals = ft_reordered.values
-    min_val = np.nanpercentile(vals, 5)
-    max_val = np.nanpercentile(vals, 95) or 1.0
-    val_diff = (max_val - min_val) or 1.0
+    # Sort by mean intensity descending and take top 1000
+    sirius_features.sort(key=lambda x: x[1], reverse=True)
+    top_keys = [item[0] for item in sirius_features[:1000]]
 
-    # Build dense flat intensity matrix
-    flat_values = []
-    for r_idx, feat in enumerate(ordered_features):
-        row_vals = []
-        for c_idx, samp in enumerate(ordered_samples):
-            v = float(ft_reordered.at[feat, samp])
-            # Apply log transformation for display normalized representation
-            log_v = np.log10(v + 1) if v > 0 else 0.0
-            row_vals.append(log_v)
-        flat_values.append(row_vals)
+    row_id_to_full = {}
+    for k in top_keys:
+        rid = str(k).split("_")[0]
+        if rid.endswith(".0"): rid = rid[:-2]
+        row_id_to_full[rid] = k
 
-    # Scale computed matrix to 0..1 range
-    np_flat = np.array(flat_values)
-    flat_min = np_flat.min()
-    flat_max = np_flat.max() or 1.0
-    flat_diff = (flat_max - flat_min) or 1.0
-    scaled_values = ((np_flat - flat_min) / flat_diff).tolist()
+    # Pre-filter annotation table for top features
+    an_scans_str = an[scan_col].astype(str).values if scan_col else []
+    normalized_scans = [s[:-2] if s.endswith(".0") else s for s in an_scans_str]
+    unique_row_ids_to_keep = set(row_id_to_full.keys())
+
+    an_keep_mask = np.array([s in unique_row_ids_to_keep for s in normalized_scans])
+    an_subset = an.loc[an_keep_mask]
+
+    # Extract points with COS values
+    points = []
+    name_col = next((c for c in ["Compound_Name", "compound_name", "name", "Name"] if c in an.columns), None)
+
+    for _, row in an_subset.iterrows():
+        rid = str(row[scan_col]) if scan_col else ""
+        if rid.endswith(".0"): rid = rid[:-2]
+        if rid not in row_id_to_full: continue
+
+        # Skip MSBuddy annotations unless requested
+        is_msbuddy = str(row.get("SpectrumID", "")).startswith("MSB_") or str(row.get("Compound_Name", "")).startswith("MSBuddy:")
+        if is_msbuddy and not show_msbuddy:
+            continue
+
+        # Extract formula (formula column → InChI → SMILES)
+        formula, formula_source = _resolve_row_formula(row, formula_col, inchi_col, smiles_col)
+        if not formula:
+            continue
+
+        # Calculate COS
+        cos = calculate_carbon_oxidation_state(formula)
+        if cos is None: continue
+
+        f_key = row_id_to_full[rid]
+        points.append({
+            "metabolite": f_key,
+            "row_id": rid,
+            "formula": formula,
+            "cos": cos,
+            "formula_source": "msbuddy" if is_msbuddy else formula_source,
+            "compound_name": str(row[name_col]) if name_col and not pd.isna(row[name_col]) else "",
+            "intensity": mean_intensities.get(f_key, 1.0),
+            "superclass": str(row.get("superclass", "Unclassified")),
+            "class": str(row.get("class", "Unclassified")),
+            "subclass": str(row.get("subclass", "Unclassified")),
+            "npclassifier_superclass": str(row.get("npclassifier_superclass", "Unclassified")),
+            "npclassifier_class": str(row.get("npclassifier_class", "Unclassified")),
+            "npclassifier_pathway": str(row.get("npclassifier_pathway", "Unclassified"))
+        })
 
     return {
-        "samples": ordered_samples,
-        "features": ordered_features,
-        "values": scaled_values,
-        "raw_intensities": flat_values
+        "points": points,
+        "total_points": len(points),
+        "total_features": int(ft.shape[0]),
+        "annotated_features": int(is_annotated.sum()),
+        "msbuddy_included": bool(show_msbuddy),
+    }
+
+
+@app.get("/api/datasets/{safe_name}/unannotated-count")
+async def get_unannotated_count(safe_name: str):
+    dataset_dir = DATASETS_DIR / safe_name
+    if not dataset_dir.exists(): return {"count": 0}
+    an_path = dataset_dir / "an.parquet"
+    ft_path = dataset_dir / "ft.parquet"
+    if not an_path.exists() or not ft_path.exists(): return {"count": 0}
+
+    an = pd.read_parquet(an_path)
+    ft = pd.read_parquet(ft_path)
+
+    scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
+    formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
+
+    if not scan_col: return {"count": int(ft.shape[0])}
+
+    annotated = _get_annotated_scans(an, scan_col, formula_col, include_msbuddy=True)
+
+    unannotated = 0
+    for f_key in ft.index:
+        rid = str(f_key).split("_")[0]
+        if rid.endswith(".0"): rid = rid[:-2]
+        if rid not in annotated:
+            unannotated += 1
+    return {"count": unannotated}
+
+
+@app.get("/api/datasets/{safe_name}/formula-coverage")
+async def get_formula_coverage(safe_name: str):
+    """Molecular-formula coverage report for a dataset, with guidance on
+    improving coverage upstream via SIRIUS + ZODIAC."""
+    dataset_dir = DATASETS_DIR / safe_name
+    if not dataset_dir.exists():
+        raise HTTPException(404, f"Dataset {safe_name} not found")
+    an_path = dataset_dir / "an.parquet"
+    ft_path = dataset_dir / "ft.parquet"
+    if not ft_path.exists():
+        raise HTTPException(404, "Feature table missing")
+
+    ft = pd.read_parquet(ft_path)
+    total_features = int(ft.shape[0])
+    ft_rids = set()
+    for k in ft.index:
+        rid = str(k).split("_")[0]
+        if rid.endswith(".0"): rid = rid[:-2]
+        ft_rids.add(rid)
+
+    by_source = {"sirius_or_library": 0, "inchi": 0, "smiles": 0, "msbuddy": 0}
+    annotated_rids: set = set()
+
+    if an_path.exists():
+        an = pd.read_parquet(an_path)
+        scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
+        formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
+        inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
+        smiles_col = next((c for c in an.columns if c.lower() in ("smiles", "smile")), None)
+        if scan_col:
+            for _, row in an.iterrows():
+                rid = str(row[scan_col])
+                if rid.endswith(".0"):
+                    rid = rid[:-2]
+                if rid not in ft_rids or rid in annotated_rids:
+                    continue
+                is_msbuddy = str(row.get("SpectrumID", "")).startswith("MSB_") or str(row.get("Compound_Name", "")).startswith("MSBuddy:")
+                formula, source = _resolve_row_formula(row, formula_col, inchi_col, smiles_col)
+                if not formula:
+                    continue
+                annotated_rids.add(rid)
+                by_source["msbuddy" if is_msbuddy else source] += 1
+
+    annotated_total = len(annotated_rids)
+    return {
+        "total_features": total_features,
+        "annotated_features": annotated_total,
+        "unannotated_features": total_features - annotated_total,
+        "coverage_pct": round(100.0 * annotated_total / total_features, 2) if total_features else 0.0,
+        "by_source": by_source,
+        "rdkit_available": _RDKIT_AVAILABLE,
+        "zodiac": {
+            "runs_in_portal": False,
+            "reason": "ZODIAC is part of SIRIUS and requires raw MS/MS spectra (.mgf/.ms); this portal stores processed tables only.",
+            "how_to_enable": [
+                "Run SIRIUS (GUI or CLI) on your raw spectra with ZODIAC enabled — it re-ranks molecular formula candidates using dataset-wide network relationships, typically improving correct formulas by 10-20%.",
+                "SIRIUS CLI example: sirius --input spectra.mgf --output results formula zodiac fingerprint structure canopus",
+                "In the SIRIUS GUI, ZODIAC runs as part of the Formula Identification step when compounds are computed together.",
+                "Export the SIRIUS annotation table (with a molecular_formula column) and re-upload it to this portal.",
+            ],
+        },
     }
 
 

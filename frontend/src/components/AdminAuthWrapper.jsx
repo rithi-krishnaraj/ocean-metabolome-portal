@@ -5,23 +5,23 @@ import { Lock, HelpCircle, CheckCircle, ArrowLeft } from 'lucide-react'; // Adde
 const SECURITY_QUESTIONS = [
   {
     question: "What was your first pet's name?",
-    answer: "buddy",
+    answer: import.meta.env.VITE_SECURITY_ANSWER_1,
   },
   {
     question: "What is your mother's maiden name?",
-    answer: "smith",
+    answer: import.meta.env.VITE_SECURITY_ANSWER_2,
   },
   {
     question: "What city were you born in?",
-    answer: "newyork",
+    answer: import.meta.env.VITE_SECURITY_ANSWER_3,
   },
   {
     question: "What is your favorite book?",
-    answer: "thehobbit",
+    answer: import.meta.env.VITE_SECURITY_ANSWER_4,
   },
   {
     question: "What is the name of your elementary school?",
-    answer: "oakhill",
+    answer: import.meta.env.VITE_SECURITY_ANSWER_5,
   },
 ];
 
@@ -39,14 +39,13 @@ export default function AdminAuthWrapper() {
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
 
-  // IMPORTANT: In a real application, this password should NOT be hardcoded
-  // and should be securely fetched from an environment variable or a backend service.
-  // For the purpose of this example, we'll store the "reset" password in localStorage for persistence
+  // Password from .env file with localStorage override for runtime changes
   const getCorrectPassword = () => {
-    return localStorage.getItem('adminPassword') || 'adminpassword';
+    return localStorage.getItem('adminPassword') || import.meta.env.VITE_ADMIN_PASSWORD || 'adminpassword';
   };
 
   const setAdminPassword = (newP) => {
+    // Store password reset in localStorage (overrides .env value)
     localStorage.setItem('adminPassword', newP);
   };
 

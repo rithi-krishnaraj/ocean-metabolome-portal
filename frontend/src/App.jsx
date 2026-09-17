@@ -23,6 +23,7 @@ function AppShell() {
     setColorOptions(opts)
     if (!opts.includes(colorBy)) setColorBy('_dataset')
   }
+
   const showColorControl = location.pathname === '/'
 
   return (

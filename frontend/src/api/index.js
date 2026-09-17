@@ -42,5 +42,13 @@ export const getMapSampleDetails = (datasetSafe, lat, lon, sampleId) => {
 
 export const getMetaboliteFeatureMatches = (body) => req('POST', '/map/metabolite-features', body)
 export const getDatasetMetadataSchema = (safeName) => req('GET', `/datasets/${safeName}/metadata-schema`)
+export const getDatasetMetabolites = (safeName) => req('GET', `/datasets/${safeName}/metabolites`)
+export const getBoxplotData = (safeName, metabolite, samples) => req('POST', `/datasets/${safeName}/boxplot-data`, { metabolite, samples })
 export const runMapPcoa = (body) => req('POST', '/map/pcoa', body)
-export const getDatasetHeatmap = (safeName) => req('GET', `/datasets/${safeName}/heatmap`)
+export const getVanKrevelenData = (safeName, showMsbuddy = false) =>
+  req('GET', `/datasets/${safeName}/vankrevelen${showMsbuddy ? '?show_msbuddy=true' : ''}`)
+export const getCarbonOxStateData = (safeName, showMsbuddy = false) =>
+  req('GET', `/datasets/${safeName}/carbon-ox-state${showMsbuddy ? '?show_msbuddy=true' : ''}`)
+export const getFormulaCoverage = (safeName) => req('GET', `/datasets/${safeName}/formula-coverage`)
+export const runDatasetAnnotation = (safeName, body) => req('POST', `/datasets/${safeName}/annotate`, body)
+export const getUnannotatedCount = (safeName) => req('GET', `/datasets/${safeName}/unannotated-count`)

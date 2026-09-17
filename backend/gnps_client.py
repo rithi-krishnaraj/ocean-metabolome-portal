@@ -112,34 +112,3 @@ def _load_gnps1_fbmn(task_id: str) -> TableTuple:
 
     ft = _add_metabolite_index(ft)
     return ft, md, an
-
-
-def load_cmn(task_id: str) -> TableTuple:
-    """Load CMN tables from GNPS2 resultfile URLs."""
-    ft_url = (
-        "https://gnps2.org/resultfile?task="
-        f"{task_id}&file=nf_output/clustering/featuretable_reformatted_precursorintensity.csv"
-    )
-    md_url = f"https://gnps2.org/resultfile?task={task_id}&file=nf_output/metadata/merged_metadata.tsv"
-    an_url = f"https://gnps2.org/resultfile?task={task_id}&file=nf_output/library/merged_results_with_gnps.tsv"
-
-    try:
-        ft = pd.read_csv(ft_url)
-    except Exception as exc:
-        raise RuntimeError(f"Could not load CMN feature table for task '{task_id}'. Error: {exc}") from exc
-
-    if ft is None or ft.empty:
-        raise RuntimeError(f"Could not load CMN feature table for task '{task_id}'.")
-
-    try:
-        md_raw = pd.read_csv(md_url, sep="\t")
-    except Exception:
-        md_raw = None
-
-    try:
-        an = pd.read_csv(an_url, sep="\t")
-    except Exception:
-        an = None
-
-    ft = _add_metabolite_index(ft)
-    return ft, _normalize_metadata(md_raw), an

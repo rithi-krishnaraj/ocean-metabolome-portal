@@ -1,12 +1,13 @@
 import { useState, useRef, useEffect } from 'react'
 import { Database, MapPin, FlaskConical, X } from 'lucide-react'
 
-export default function StatsPanel({ datasets = [], samples = 0, features = 0 }) {
+export default function StatsPanel({ datasets = [], visibleDatasets, samples = 0, features = 0 }) {
   const [showDropdown, setShowDropdown] = useState(false)
   const dropdownRef = useRef(null)
 
   const isArray = Array.isArray(datasets)
-  const count = isArray ? datasets.length : Number(datasets)
+  const displayDatasets = visibleDatasets !== undefined && Array.isArray(visibleDatasets) ? visibleDatasets : datasets
+  const count = displayDatasets.length
   const hasDetails = isArray && datasets.length > 0
 
   // Close dropdown when clicking outside

@@ -305,7 +305,6 @@ export default function AdminPage() {
                     onChange={(e) => setWorkflow(e.target.value)}
                   >
                     <option value="fbmn">FBMN (Feature-Based Molecular Networking)</option>
-                    <option value="cmn">CMN (Classical Molecular Networking)</option>
                   </select>
                 </div>
                 <p className="text-xs text-slate-500">

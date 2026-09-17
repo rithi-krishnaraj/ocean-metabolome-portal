@@ -1,6 +1,6 @@
 {
-  "name": "454547be77d94ae1ad00d798046ee7a0",
-  "safe_name": "454547be77d94ae1ad00d798046ee7a0",
+  "name": "Ocean Dataset",
+  "safe_name": "Ocean_Dataset",
   "source_task_id": "454547be77d94ae1ad00d798046ee7a0",
   "has_coords": true,
   "lat_col": "ATTRIBUTE_Latitude",
