@@ -1,6 +1,6 @@
 """
 data_processor.py
-Data parsing, cleaning, blank removal, imputation, and combined-table creation.
+Data parsing, cleaning, feature indexing, and combined-table creation.
 Adapted from FBMN-STATS-Webapp/src/cleanup.py and the existing portal logic.
 """
 from __future__ import annotations
@@ -18,6 +18,23 @@ import pandas as pd
 
 LAT_ALIASES = ["ATTRIBUTE_Latitude", "Latitude", "latitude", "lat", "LAT"]
 LON_ALIASES = ["ATTRIBUTE_Longitude", "Longitude", "longitude", "lon", "long", "LON"]
+
+# GNPS/MZmine feature-table columns that describe the feature, not a sample.
+FEATURE_DESCRIPTOR_COLUMNS = {
+    "row ID",
+    "row m/z",
+    "row retention time",
+    "row ion mobility",
+    "row ion mobility unit",
+    "row CCS",
+    "correlation group ID",
+    "annotation network number",
+    "best ion",
+    "auto MS2 verify",
+    "identified by n=",
+    "partners",
+    "neutral M mass",
+}
 
 
 def _find_coord_column(columns: list[str], aliases: list[str], kind: str) -> Optional[str]:
@@ -63,7 +80,11 @@ def parse_file(content: bytes, filename: str) -> Optional[pd.DataFrame]:
             df = pd.read_excel(io.BytesIO(content))
         else:
             sep = "\t" if ext in ("tsv", "txt") else ","
-            df = pd.read_csv(io.BytesIO(content), sep=sep, on_bad_lines="skip")
+            try:
+                # pyarrow's multithreaded parser is ~3× faster on large feature tables
+                df = pd.read_csv(io.BytesIO(content), sep=sep, engine="pyarrow")
+            except ValueError:  # malformed rows: fall back to the tolerant C parser
+                df = pd.read_csv(io.BytesIO(content), sep=sep, on_bad_lines="skip")
 
         if "Unnamed: 0" in df.columns:
             df = df.drop(columns=["Unnamed: 0"])
@@ -74,20 +95,119 @@ def parse_file(content: bytes, filename: str) -> Optional[pd.DataFrame]:
 
 
 # ---------------------------------------------------------------------------
+# Feature index  (rowID_mz_rt, as produced by FBMN-STATS)
+# ---------------------------------------------------------------------------
+
+_MZ_PATTERNS = ["m/z", "mz", "mass over charge"]
+_RT_PATTERNS = ["rt", "retention time", "retention-time", "retention_time"]
+
+
+def _mz_rt_columns(ft: pd.DataFrame) -> tuple[Optional[str], Optional[str]]:
+    """First m/z-like and RT-like column names (FBMN-STATS get_new_index patterns)."""
+    def first_match(patterns):
+        for col in ft.columns:
+            c = str(col).lower()
+            # sample files (.mzML/.mzXML) contain "mz" but are not descriptors
+            if "mzml" not in c and "mzxml" not in c and any(p in c for p in patterns):
+                return col
+        return None
+    return first_match(_MZ_PATTERNS), first_match(_RT_PATTERNS)
+
+
+def index_feature_table(ft: pd.DataFrame) -> pd.DataFrame:
+    """Give an uploaded feature table its metabolite index, as FBMN-STATS load_ft does:
+
+    1. a 'metabolite' column, if present;
+    2. GNPS/MZmine 'row ID' + 'row m/z' + 'row retention time' → rowID_mz_rt
+       (the same IDs a GNPS task load produces);
+    3. otherwise the first m/z-like and RT-like columns → [rowID_]mz@rt.
+    Must run before clean_feature_table(), which drops those columns.
+    """
+    if "metabolite" in ft.columns:
+        ft.index = ft["metabolite"].astype(str)
+        ft.index.name = "metabolite"
+        return ft
+    if {"row ID", "row m/z", "row retention time"} <= set(ft.columns):
+        return add_metabolite_index(ft)
+
+    mz_col, rt_col = _mz_rt_columns(ft)
+    if mz_col is None or rt_col is None:
+        return ft
+    try:
+        key = ft[mz_col].astype(float).round(5).astype(str) + "@" + ft[rt_col].astype(float).round(2).astype(str)
+    except (TypeError, ValueError):
+        return ft
+    if "row ID" in ft.columns:
+        key = ft["row ID"].astype(str) + "_" + key
+    ft.index = key
+    ft.index.name = "metabolite"
+    return ft
+
+
+def _clean_sample_name(name: object) -> str:
+    return str(name).strip().replace(".mzXML", "").replace(".mzML", "").replace(" Peak area", "")
+
+
+def set_metadata_index(md: pd.DataFrame, sample_names) -> pd.DataFrame:
+    """Index metadata by sample filename, as FBMN-STATS load_md does.
+
+    Uses the 'filename' column; without one, picks the unique-valued column whose
+    values best match the feature table's (cleaned) sample names.
+    """
+    if "filename" in md.columns:
+        return md.set_index("filename")
+
+    targets = {_clean_sample_name(s) for s in sample_names}
+    best_col, best_hits = None, 0
+    for col in md.columns:
+        values = md[col].dropna().astype(str)
+        if len(values) != len(md) or not values.is_unique:
+            continue
+        hits = sum(_clean_sample_name(v) in targets for v in values)
+        if hits > best_hits:
+            best_col, best_hits = col, hits
+    if best_col is None:
+        raise ValueError(
+            "Metadata needs a 'filename' column whose values match the feature table's sample columns."
+        )
+    return md.set_index(best_col).rename_axis("filename")
+
+
+def add_metabolite_index(ft: pd.DataFrame) -> pd.DataFrame:
+    """Index a GNPS/MZmine feature table by ``rowID_mz_rt``.
+
+    Must run before clean_feature_table(), which drops the row ID / m/z / RT
+    columns. Tables without those columns are returned unchanged.
+    """
+    try:
+        row_ids = ft["row ID"].map(
+            lambda v: str(int(v)) if isinstance(v, (int, float, np.number)) and float(v).is_integer() else str(v)
+        )
+        mz = ft["row m/z"].map(lambda v: str(round(float(v), 4)))
+        rt = ft["row retention time"].map(lambda v: str(round(float(v), 2)))
+    except (KeyError, TypeError, ValueError):
+        return ft
+    ft.index = row_ids + "_" + mz + "_" + rt
+    ft.index.name = "metabolite"
+    return ft
+
+
+# ---------------------------------------------------------------------------
 # Feature table cleaning  (from FBMN-STATS cleanup.py)
 # ---------------------------------------------------------------------------
 
 def clean_feature_table(ft: pd.DataFrame) -> pd.DataFrame:
     """Remove non-sample columns and normalise column names."""
-    ft = ft.copy().dropna(how="all")
+    # Drop only completely empty rows/columns; a sample with a few empty cells must not be lost.
+    ft = ft.copy().dropna(how="all").dropna(axis=1, how="all")
 
-    sample_cols = [c for c in ft.columns if ".mzML" in c or ".mzXML" in c]
+    sample_cols = [c for c in ft.columns if ".mzML" in str(c) or ".mzXML" in str(c)]
 
     if sample_cols:
         ft = ft[sample_cols]
         ft.rename(
             columns={
-                c: re.sub(r"\s*Peak area$", "", c)
+                c: re.sub(r"\s*Peak area$", "", str(c))
                     .replace(".mzXML", "")
                     .replace(".mzML", "")
                     .strip()
@@ -96,8 +216,13 @@ def clean_feature_table(ft: pd.DataFrame) -> pd.DataFrame:
             inplace=True,
         )
     else:
-        # Accept numeric columns if no standard extensions found
-        numeric_cols = ft.select_dtypes(include="number").columns.tolist()
+        # No standard extensions: treat numeric columns as samples, except the
+        # feature descriptors (row ID, m/z, RT, ...), which are numeric too.
+        descriptors = FEATURE_DESCRIPTOR_COLUMNS | {str(c) for c in _mz_rt_columns(ft) if c is not None}
+        numeric_cols = [
+            c for c in ft.select_dtypes(include="number").columns
+            if str(c) not in descriptors
+        ]
         if numeric_cols:
             ft = ft[numeric_cols]
 
@@ -138,80 +263,15 @@ def validate_coordinates(md: pd.DataFrame) -> tuple[bool, Optional[str], Optiona
 
 
 # ---------------------------------------------------------------------------
-# Metadata column info  (for blank-removal UI)
-# ---------------------------------------------------------------------------
-
-def get_md_column_info(md: pd.DataFrame) -> list[dict]:
-    """Return per-column value counts for the blank-removal selectors."""
-    if md is None or md.empty:
-        return []
-    result = []
-    for col in md.columns:
-        vc = md[col].dropna().astype(str).value_counts()
-        result.append({
-            "column": col,
-            "levels": list(vc.index[:30]),
-            "counts": [int(v) for v in vc.values[:30]],
-        })
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Blank removal  (from FBMN-STATS cleanup.py)
-# ---------------------------------------------------------------------------
-
-def remove_blank_features(
-    blanks: pd.DataFrame,
-    samples: pd.DataFrame,
-    cutoff: float = 0.3,
-) -> tuple[pd.DataFrame, int, int]:
-    """
-    Remove features whose blank/sample intensity ratio exceeds *cutoff*.
-    Returns (cleaned_samples_ft, n_background_features, n_real_features).
-    """
-    avg_blank = blanks.mean(axis=1, skipna=False)
-    avg_samples = samples.mean(axis=1, skipna=False)
-    ratio = (avg_blank + 1) / (avg_samples + 1)
-    is_real = ratio < cutoff
-
-    cleaned = samples[is_real.values]
-    n_bg = int(len(samples) - is_real.sum())
-    n_real = int(is_real.sum())
-    return cleaned, n_bg, n_real
-
-
-# ---------------------------------------------------------------------------
-# Imputation  (from FBMN-STATS cleanup.py)
-# ---------------------------------------------------------------------------
-
-def impute_missing_values(
-    ft: pd.DataFrame,
-    cutoff_lod: Optional[float] = None,
-) -> pd.DataFrame:
-    """Replace zeros with random values between 1 and the limit of detection."""
-    if cutoff_lod is None:
-        min_val = ft.replace(0, np.nan).min(numeric_only=True).min()
-        cutoff_lod = round(float(min_val)) if not pd.isna(min_val) else 1
-
-    if cutoff_lod <= 1:
-        return ft
-
-    return ft.apply(
-        lambda col: [np.random.randint(1, int(cutoff_lod)) if v == 0 else v for v in col]
-    )
-
-
-# ---------------------------------------------------------------------------
-# Combined annotated table
+# Combined table  (admin preview only)
 # ---------------------------------------------------------------------------
 
 def create_combined_table(
     ft: Optional[pd.DataFrame],
     md: Optional[pd.DataFrame],
-    an: Optional[pd.DataFrame] = None,
 ) -> Optional[pd.DataFrame]:
     """
-    Transpose ft so rows = samples, then join with md (and optionally an).
+    Transpose ft so rows = samples, then join with md.
     Result: each row is a sample, columns = metadata + feature intensities.
     """
     if ft is None or md is None or ft.empty or md.empty:
@@ -222,22 +282,6 @@ def create_combined_table(
         common = [s for s in md.index if s in ft_t.index]
         if not common:
             return None
-
-        combined = pd.concat([md.loc[common], ft_t.loc[common]], axis=1)
-
-        if an is not None and not an.empty:
-            if "row ID" in ft.columns and "#Scan#" in an.columns:
-                an_m = an.copy()
-                an_m["#Scan#"] = an_m["#Scan#"].astype(str)
-                an_cols = [c for c in an_m.columns if c not in combined.columns]
-                if an_cols:
-                    combined = combined.merge(
-                        an_m[["#Scan#"] + an_cols],
-                        left_on="row ID",
-                        right_on="#Scan#",
-                        how="left",
-                    )
-
-        return combined
+        return pd.concat([md.loc[common], ft_t.loc[common]], axis=1)
     except Exception:
         return None

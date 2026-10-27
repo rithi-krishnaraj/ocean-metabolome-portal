@@ -4,10 +4,12 @@ import {
   getPaginationRowModel,
   flexRender,
 } from '@tanstack/react-table'
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 
-export default function DataTable({ data = [], pageSize = 10 }) {
+// Memoised: the admin page re-renders on every keystroke (dataset name, column toggles),
+// and the table only needs to update when its data changes.
+export default memo(function DataTable({ data = [], pageSize = 10 }) {
   const columns = useMemo(() => {
     if (!data?.length) return []
     return Object.keys(data[0]).map((key) => ({
@@ -95,4 +97,4 @@ export default function DataTable({ data = [], pageSize = 10 }) {
       </div>
     </div>
   )
-}
+})

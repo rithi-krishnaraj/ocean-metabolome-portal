@@ -4,9 +4,13 @@ Routes for manual upload, GNPS task loading, dataset management, and map data.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
+import secrets
 import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -18,20 +22,19 @@ import pyarrow.parquet as pq
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from data_processor import (
     clean_feature_table,
     clean_metadata_table,
     create_combined_table,
-    get_md_column_info,
-    impute_missing_values,
     parse_file,
-    remove_blank_features,
     validate_coordinates,
 )
-from gnps_client import load_fbmn
+from gnps_client import GNPS2_WORKFLOW_KEYS, detect_workflow, load_eb, load_fbmn
 
 # Optional RDKit — enables SMILES → molecular formula fallback for Van Krevelen plots
 try:
@@ -65,6 +68,35 @@ sessions: dict = {}
 DATASET_DF_CACHE = {}  # dataset_safe -> {"md": DataFrame, "ft": DataFrame, "mtime_md": float, "mtime_ft": float}
 PCOA_CACHE = {}        # (dataset_safe, distance_metric, sample_cols_tuple) -> {"evals": ndarray, "evecs": ndarray, "proportion_explained": list}
 
+# ---------------------------------------------------------------------------
+# Admin authentication
+# ---------------------------------------------------------------------------
+
+# Local runs read the repo-root .env; in Docker, env_file already sets the variable
+# (load_dotenv never overrides a variable that is already set).
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+ADMIN_TOKEN_TTL_SECONDS = 12 * 60 * 60
+
+# In-memory admin tokens: token → expiry timestamp. A backend restart logs everyone out.
+admin_tokens: dict[str, float] = {}
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _admin_password() -> str:
+    return os.environ.get("ADMIN_PASSWORD", "")
+
+
+def require_admin(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> None:
+    """Dependency for admin-only routes: requires a valid token from /api/admin/login."""
+    now = time.time()
+    for token, expiry in list(admin_tokens.items()):
+        if expiry <= now:
+            admin_tokens.pop(token, None)
+    if creds is None or creds.credentials not in admin_tokens:
+        raise HTTPException(401, "Admin login required.", headers={"WWW-Authenticate": "Bearer"})
+
 def parse_feature_labels(columns):
     """Parse feature labels formatted as ID_mz@RT.
 
@@ -95,9 +127,12 @@ def get_cached_dataset(dataset_safe: str, dataset_dir: Path):
     mtime_md = md_path.stat().st_mtime
     mtime_ft = ft_path.stat().st_mtime
 
+    # Public columns are applied on every call (not cached), so editing them takes effect at once.
+    meta = _read_meta(dataset_dir)
+
     cached = DATASET_DF_CACHE.get(dataset_safe)
     if cached and cached["mtime_md"] == mtime_md and cached["mtime_ft"] == mtime_ft:
-        return cached["md"].copy(), cached["ft"].copy()
+        return _public_md(cached["md"], meta).copy(), cached["ft"].copy()
 
     md = pd.read_parquet(md_path)
     ft = pd.read_parquet(ft_path)
@@ -107,7 +142,7 @@ def get_cached_dataset(dataset_safe: str, dataset_dir: Path):
         "mtime_md": mtime_md,
         "mtime_ft": mtime_ft
     }
-    return md.copy(), ft.copy()
+    return _public_md(md, meta).copy(), ft.copy()
 
 
 def _dataset_mtimes(dataset_dir: Path) -> tuple[float, float]:
@@ -120,11 +155,20 @@ def _dataset_mtimes(dataset_dir: Path) -> tuple[float, float]:
     )
 
 
-def _df_records(df: Optional[pd.DataFrame], max_rows: int = 200) -> list:
+PREVIEW_MAX_ROWS = 200
+# Feature and combined tables have one column per sample or feature (thousands); previews
+# keep the first columns so the response and the admin table stay small.
+PREVIEW_MAX_COLS = 50
+
+
+def _df_records(
+    df: Optional[pd.DataFrame],
+    max_rows: int = PREVIEW_MAX_ROWS,
+    max_cols: Optional[int] = PREVIEW_MAX_COLS,
+) -> list:
     if df is None or df.empty:
         return []
-    df = df.head(max_rows).copy()
-    df = df.reset_index()
+    df = df.iloc[:max_rows, :max_cols].reset_index()
     # Replace NaN with None for JSON serialisation
     return json.loads(df.to_json(orient="records", default_handler=str))
 
@@ -137,6 +181,48 @@ def _df_columns(df: Optional[pd.DataFrame]) -> list:
 
 def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+def _dataset_name_taken(name: str, exclude_safe: Optional[str] = None) -> bool:
+    """Whether another saved dataset already uses this display name (case-insensitive)."""
+    wanted = name.strip().lower()
+    for meta_path in DATASETS_DIR.glob("*/meta.json"):
+        if meta_path.parent.name == exclude_safe:
+            continue
+        try:
+            if str(json.loads(meta_path.read_text()).get("name", "")).strip().lower() == wanted:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _validated_md_columns(requested, md: pd.DataFrame) -> list:
+    """Public metadata columns: the requested ones that exist, in table order; all if none requested."""
+    if requested is None:
+        return list(md.columns)
+    if not isinstance(requested, list):
+        raise HTTPException(400, "md_columns must be a list of column names.")
+    wanted = {str(c) for c in requested}
+    return [c for c in md.columns if str(c) in wanted]
+
+
+def _public_md(md: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    """Drop metadata columns the admin has not made public.
+
+    Coordinates are always kept: they place samples on the map.
+    """
+    public = meta.get("md_columns")
+    if public is None or md is None or md.empty:
+        return md
+    keep = {str(c) for c in public}
+    coords = {str(meta.get(k) or "").strip().lower() for k in ("lat_col", "lon_col")}
+    return md[[c for c in md.columns if str(c) in keep or str(c).strip().lower() in coords]]
+
+
+def _read_meta(dataset_dir: Path) -> dict:
+    meta_path = dataset_dir / "meta.json"
+    return json.loads(meta_path.read_text()) if meta_path.exists() else {}
 
 
 def _find_column_case_insensitive(df: pd.DataFrame, target: Optional[str]) -> Optional[str]:
@@ -236,10 +322,33 @@ def _parse_feature_parts(feature_key: str) -> tuple[str, Optional[float], Option
 
 
 # ---------------------------------------------------------------------------
+# Admin login
+# ---------------------------------------------------------------------------
+
+@app.post("/api/admin/login")
+async def admin_login(body: dict):
+    expected = _admin_password()
+    if not expected:
+        # Fail closed: without a configured password nobody can log in.
+        raise HTTPException(503, "Admin login is disabled: ADMIN_PASSWORD is not set on the server.")
+
+    password = body.get("password")
+    if not isinstance(password, str) or not secrets.compare_digest(
+        password.encode("utf-8"), expected.encode("utf-8")
+    ):
+        await asyncio.sleep(1)  # slow down password guessing
+        raise HTTPException(401, "Incorrect password.")
+
+    token = secrets.token_urlsafe(32)
+    admin_tokens[token] = time.time() + ADMIN_TOKEN_TTL_SECONDS
+    return {"token": token, "expires_in": ADMIN_TOKEN_TTL_SECONDS}
+
+
+# ---------------------------------------------------------------------------
 # Upload – manual files
 # ---------------------------------------------------------------------------
 
-@app.post("/api/upload/manual")
+@app.post("/api/upload/manual", dependencies=[Depends(require_admin)])
 async def upload_manual(
     ft_file: UploadFile = File(...),
     md_file: UploadFile = File(...),
@@ -265,7 +374,7 @@ async def upload_manual(
         an = parse_file(await an_file.read(), an_file.filename)
 
     has_coords, lat_col, lon_col = validate_coordinates(md)
-    combined = create_combined_table(ft, md, an)
+    combined = create_combined_table(ft, md)
 
     session_id = str(uuid.uuid4())
     sessions[session_id] = dict(
@@ -291,9 +400,11 @@ async def upload_manual(
         "ft_columns": _df_columns(ft),
         "md_columns": _df_columns(md),
         "ft_preview": _df_records(ft),
-        "md_preview": _df_records(md),
+        "md_preview": _df_records(md, max_cols=None),
         "an_preview": _df_records(an),
         "combined_preview": _df_records(combined),
+        "preview_max_rows": PREVIEW_MAX_ROWS,
+        "preview_max_cols": PREVIEW_MAX_COLS,
     }
 
 
@@ -301,7 +412,28 @@ async def upload_manual(
 # Upload – GNPS task ID
 # ---------------------------------------------------------------------------
 
-@app.post("/api/upload/gnps")
+WORKFLOW_LABELS = {"fbmn": "FBMN", "eb": "EB (Everything Bagel)"}
+
+
+async def _gnps_load_error(task_id: str, workflow: str, exc: Exception) -> str:
+    """Explain a failed GNPS load, naming the right workflow when the wrong one was selected."""
+    actual = await asyncio.to_thread(detect_workflow, task_id)
+    if actual:
+        actual_key = GNPS2_WORKFLOW_KEYS.get(actual)
+        if actual_key is None:
+            return (
+                f"Task '{task_id}' is a GNPS2 '{actual}' task, which the portal cannot import. "
+                "Use an FBMN or Everything Bagel task ID."
+            )
+        if actual_key != workflow:
+            return (
+                f"Task '{task_id}' is an {WORKFLOW_LABELS[actual_key]} task, but {WORKFLOW_LABELS[workflow]} is selected. "
+                f"Change the workflow type to {WORKFLOW_LABELS[actual_key]} and load again."
+            )
+    return f"Failed to load from GNPS: {exc}"
+
+
+@app.post("/api/upload/gnps", dependencies=[Depends(require_admin)])
 async def upload_gnps(body: dict):
     task_id = body.get("task_id", "").strip()
     workflow = body.get("workflow", "fbmn")
@@ -309,20 +441,24 @@ async def upload_gnps(body: dict):
     if not task_id:
         raise HTTPException(400, "task_id is required.")
 
+    loaders = {"fbmn": load_fbmn, "eb": load_eb}
+    if workflow not in loaders:
+        raise HTTPException(400, f"Unknown workflow '{workflow}'. Use one of: {', '.join(loaders)}.")
+
     try:
-        if workflow == "fbmn":
-            ft, md, an = load_fbmn(task_id)
+        # Downloads can take minutes; run them off the event loop so other requests keep working.
+        ft, md, an = await asyncio.to_thread(loaders[workflow], task_id)
     except Exception as exc:
-        raise HTTPException(400, f"Failed to load from GNPS: {exc}")
+        raise HTTPException(400, await _gnps_load_error(task_id, workflow, exc))
 
     if ft is None or ft.empty:
         raise HTTPException(400, "GNPS returned an empty feature table. Check the task ID.")
 
     ft = clean_feature_table(ft)
-    md = clean_metadata_table(md) if md is not None and not md.empty else md or pd.DataFrame()
+    md = clean_metadata_table(md) if md is not None and not md.empty else pd.DataFrame()
 
     has_coords, lat_col, lon_col = validate_coordinates(md)
-    combined = create_combined_table(ft, md, an)
+    combined = create_combined_table(ft, md)
 
     session_id = str(uuid.uuid4())
     sessions[session_id] = dict(
@@ -349,74 +485,39 @@ async def upload_gnps(body: dict):
         "ft_columns": _df_columns(ft),
         "md_columns": _df_columns(md),
         "ft_preview": _df_records(ft),
-        "md_preview": _df_records(md),
+        "md_preview": _df_records(md, max_cols=None),
         "an_preview": _df_records(an),
         "combined_preview": _df_records(combined),
+        "preview_max_rows": PREVIEW_MAX_ROWS,
+        "preview_max_cols": PREVIEW_MAX_COLS,
     }
-
-
-# ---------------------------------------------------------------------------
-# Session helpers
-# ---------------------------------------------------------------------------
-
-@app.get("/api/session/{session_id}/md-info")
-async def session_md_info(session_id: str):
-    sess = sessions.get(session_id)
-    if not sess:
-        raise HTTPException(404, "Session not found or expired.")
-    return {"columns_info": get_md_column_info(sess["md"])}
-
-
-@app.post("/api/session/{session_id}/blank-removal-preview")
-async def blank_removal_preview(session_id: str, body: dict):
-    sess = sessions.get(session_id)
-    if not sess:
-        raise HTTPException(404, "Session not found or expired.")
-
-    ft = sess["ft"]
-    md = sess["md"]
-    sample_col = body.get("sample_column")
-    sample_vals = body.get("sample_rows", [])
-    blank_col = body.get("blank_column")
-    blank_vals = body.get("blank_rows", [])
-    cutoff = float(body.get("cutoff", 0.3))
-
-    try:
-        sample_idx = md[md[sample_col].isin(sample_vals)].index
-        blank_idx = md[md[blank_col].isin(blank_vals)].index
-        samples_df = ft[ft.columns.intersection(sample_idx)]
-        blanks_df = ft[ft.columns.intersection(blank_idx)]
-
-        ft_cleaned, n_bg, n_real = remove_blank_features(blanks_df, samples_df, cutoff)
-        sess["ft_cleaned"] = ft_cleaned
-    except Exception as exc:
-        raise HTTPException(400, f"Blank removal failed: {exc}")
-
-    return {"n_background": n_bg, "n_real": n_real, "new_shape": list(ft_cleaned.shape)}
 
 
 # ---------------------------------------------------------------------------
 # Save dataset
 # ---------------------------------------------------------------------------
 
-@app.post("/api/dataset/save")
+@app.post("/api/dataset/save", dependencies=[Depends(require_admin)])
 async def save_dataset(body: dict):
     session_id = body.get("session_id", "")
     name = body.get("name", "").strip()
-    do_impute = bool(body.get("impute", False))
 
     if not name:
         raise HTTPException(400, "Dataset name is required.")
     if not session_id or session_id not in sessions:
         raise HTTPException(404, "Session not found or expired.")
 
-    safe = _safe_name(name)
-    dataset_dir = DATASETS_DIR / safe
-
-    if dataset_dir.exists():
+    if _dataset_name_taken(name):
         raise HTTPException(409, f"A dataset named '{name}' already exists.")
 
-    dataset_dir.mkdir(parents=True)
+    # Renamed datasets keep their folder, so a free name can still map to a used folder: add a suffix.
+    base_safe = safe = _safe_name(name)
+    suffix = 2
+    while (DATASETS_DIR / safe).exists():
+        safe = f"{base_safe}_{suffix}"
+        suffix += 1
+    dataset_dir = DATASETS_DIR / safe
+
     sess = sessions[session_id]
 
     if not sess.get("has_coords", False):
@@ -424,15 +525,13 @@ async def save_dataset(body: dict):
             400,
             "Dataset cannot be saved: metadata must include Latitude and Longitude columns.",
         )
+    dataset_dir.mkdir(parents=True)
 
-    ft: pd.DataFrame = sess.get("ft_cleaned", sess["ft"]).copy()
+    ft: pd.DataFrame = sess["ft"].copy()
     md: pd.DataFrame = sess["md"].copy()
     an: Optional[pd.DataFrame] = sess.get("an")
 
-    if do_impute:
-        ft = impute_missing_values(ft)
-
-    combined = create_combined_table(ft, md, an)
+    combined = create_combined_table(ft, md)
 
     # Save as parquet (fast, compact)
     ft.to_parquet(dataset_dir / "ft.parquet")
@@ -453,7 +552,9 @@ async def save_dataset(body: dict):
         "n_samples": int(md.shape[0]),
         "n_features": int(ft.shape[0]),
         "has_annotation": an is not None and not an.empty,
-        "md_columns": list(md.columns),
+        # Public metadata columns (the admin's choice; all columns if none was sent)
+        "md_columns": _validated_md_columns(body.get("visible_md_columns"), md),
+        "n_md_columns_total": int(md.shape[1]),
     }
     (dataset_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -481,10 +582,65 @@ async def list_datasets():
     return result
 
 
-@app.delete("/api/datasets/{safe_name}")
+def _dataset_dir_or_404(safe_name: str) -> Path:
+    dataset_dir = (DATASETS_DIR / safe_name).resolve()
+    # Only ever a direct child of DATASETS_DIR (blocks names like "..").
+    if dataset_dir.parent != DATASETS_DIR.resolve() or not (dataset_dir / "meta.json").is_file():
+        raise HTTPException(404, "Dataset not found.")
+    return dataset_dir
+
+
+@app.get("/api/datasets/{safe_name}/settings", dependencies=[Depends(require_admin)])
+async def get_dataset_settings(safe_name: str):
+    """Editable settings for the admin page, including every metadata column (public or not)."""
+    dataset_dir = _dataset_dir_or_404(safe_name)
+    meta = json.loads((dataset_dir / "meta.json").read_text())
+    md_path = dataset_dir / "md.parquet"
+    all_columns = list(pd.read_parquet(md_path).columns) if md_path.exists() else []
+    return {
+        "name": meta.get("name", safe_name),
+        "md_columns_all": all_columns,
+        "md_columns": [c for c in all_columns if c in set(meta.get("md_columns", all_columns))],
+        "lat_col": meta.get("lat_col"),
+        "lon_col": meta.get("lon_col"),
+    }
+
+
+@app.patch("/api/datasets/{safe_name}", dependencies=[Depends(require_admin)])
+async def update_dataset(safe_name: str, body: dict):
+    """Edit a saved dataset's display name and public metadata columns.
+
+    The folder (safe_name) stays the same, so links, caches and the files on disk are unaffected.
+    """
+    dataset_dir = _dataset_dir_or_404(safe_name)
+    meta_path = dataset_dir / "meta.json"
+    meta = json.loads(meta_path.read_text())
+
+    if "name" in body:
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "Dataset name is required.")
+        if _dataset_name_taken(name, exclude_safe=safe_name):
+            raise HTTPException(409, f"A dataset named '{name}' already exists.")
+        meta["name"] = name
+
+    if "md_columns" in body:
+        md_path = dataset_dir / "md.parquet"
+        md = pd.read_parquet(md_path) if md_path.exists() else pd.DataFrame()
+        meta["md_columns"] = _validated_md_columns(body.get("md_columns"), md)
+        meta["n_md_columns_total"] = int(md.shape[1])
+
+    meta_path.write_text(json.dumps(meta, indent=2))
+    for k in [k for k in PCOA_CACHE if k[0] == safe_name]:
+        PCOA_CACHE.pop(k, None)
+    return meta
+
+
+@app.delete("/api/datasets/{safe_name}", dependencies=[Depends(require_admin)])
 async def delete_dataset(safe_name: str):
-    dataset_dir = DATASETS_DIR / safe_name
-    if not dataset_dir.exists():
+    dataset_dir = (DATASETS_DIR / safe_name).resolve()
+    # Only ever delete a direct child of DATASETS_DIR (blocks names like "..").
+    if dataset_dir.parent != DATASETS_DIR.resolve() or not dataset_dir.is_dir():
         raise HTTPException(404, "Dataset not found.")
     shutil.rmtree(dataset_dir)
     # Invalidate caches
@@ -495,7 +651,7 @@ async def delete_dataset(safe_name: str):
     return {"success": True}
 
 
-@app.get("/api/datasets/{safe_name}/table/{table_name}")
+@app.get("/api/datasets/{safe_name}/table/{table_name}", dependencies=[Depends(require_admin)])
 async def get_dataset_table(safe_name: str, table_name: str):
     allowed = {"ft", "md", "an", "combined"}
     if table_name not in allowed:
@@ -504,7 +660,8 @@ async def get_dataset_table(safe_name: str, table_name: str):
     if not path.exists():
         return {"data": [], "columns": []}
     df = pd.read_parquet(path)
-    return {"data": _df_records(df), "columns": _df_columns(df)}
+    max_cols = None if table_name == "md" else PREVIEW_MAX_COLS
+    return {"data": _df_records(df, max_cols=max_cols), "columns": _df_columns(df)}
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +706,7 @@ async def get_map_data():
         if not meta.get("has_coords") or not md_path.exists():
             continue
 
-        lat_col = _find_column_case_insensitive(md := pd.read_parquet(md_path), meta.get("lat_col"))
+        lat_col = _find_column_case_insensitive(md := _public_md(pd.read_parquet(md_path), meta), meta.get("lat_col"))
         lon_col = _find_column_case_insensitive(md, meta.get("lon_col"))
         if not lat_col or not lon_col:
             # Skip malformed coordinate metadata instead of crashing the whole map payload.
@@ -565,12 +722,15 @@ async def get_map_data():
         else:
             index_ids = md.index.astype(str)
             md["_sample_id"] = np.where(pd.Series(index_ids).str.strip().ne(""), index_ids, fallback_ids)
-        md["_lat"] = pd.to_numeric(md[lat_col], errors="coerce")
-        md["_lon"] = pd.to_numeric(md[lon_col], errors="coerce")
-
-        # Ensure the filename (first column of metadata) is included as a regular column
+        # Ensure the filename (first column of metadata) is included as a regular column.
+        # Use assign() rather than md[...] = ...: pandas 2.2 on Python 3.14 emits a
+        # false-positive ChainedAssignmentError FutureWarning for setitem here.
         filename_col = md.index.name or "filename"
-        md[filename_col] = md.index.astype(str)
+        md = md.assign(**{
+            "_lat": pd.to_numeric(md[lat_col], errors="coerce"),
+            "_lon": pd.to_numeric(md[lon_col], errors="coerce"),
+            filename_col: md.index.astype(str),
+        })
 
         md = md.dropna(subset=["_lat", "_lon"])
 
@@ -649,7 +809,7 @@ async def get_metabolite_features(body: dict):
         if dataset_safes and dataset_safe not in dataset_safes:
             continue
 
-        md = pd.read_parquet(md_path)
+        md = _public_md(pd.read_parquet(md_path), meta)
         lat_col = _find_column_case_insensitive(md, meta.get("lat_col"))
         lon_col = _find_column_case_insensitive(md, meta.get("lon_col"))
         if not lat_col or not lon_col:
@@ -718,14 +878,12 @@ async def get_metabolite_features(body: dict):
                 continue
 
             present_samples = []
-            detected_count = 0
             for sample_col in sample_cols:
                 intensity = row[sample_col]
                 if pd.isna(intensity):
                     continue
                 try:
-                    intensity_num = float(intensity)
-                    if intensity_num < 0:
+                    if float(intensity) <= 0:
                         continue
                 except Exception:
                     continue
@@ -744,11 +902,8 @@ async def get_metabolite_features(body: dict):
                         "sample_id": str(sample_col),
                         "lat": float(lat_val),
                         "lon": float(lon_val),
-                        "intensity": intensity_num,
                     }
                 )
-                if intensity_num > 0:
-                    detected_count += 1
 
             if not present_samples:
                 continue
@@ -761,7 +916,6 @@ async def get_metabolite_features(body: dict):
                     "row_retention_time": parsed_rt,
                     "annotation": annotation_name or None,
                     "sample_count": len(present_samples),
-                    "detected_sample_count": detected_count,
                     "dataset": dataset_name,
                     "dataset_safe": dataset_safe,
                     "present_samples": present_samples,
@@ -799,7 +953,7 @@ async def get_map_sample_details(
         raise HTTPException(404, "Dataset files are missing.")
 
     meta = json.loads(meta_path.read_text())
-    lat_col = _find_column_case_insensitive(md := pd.read_parquet(md_path), meta.get("lat_col"))
+    lat_col = _find_column_case_insensitive(md := _public_md(pd.read_parquet(md_path), meta), meta.get("lat_col"))
     lon_col = _find_column_case_insensitive(md, meta.get("lon_col"))
     if not lat_col or not lon_col:
         raise HTTPException(400, "Dataset is missing coordinate column metadata.")
@@ -1019,7 +1173,7 @@ async def get_boxplot_data(safe_name: str, body: dict):
         raise HTTPException(404, "Dataset files missing")
 
     ft = pd.read_parquet(ft_path)
-    md = pd.read_parquet(md_path)
+    md = _public_md(pd.read_parquet(md_path), _read_meta(dataset_dir))
 
     if metabolite not in ft.index:
         # Try fuzzy match if exact fails (e.g. string vs int index)
@@ -1280,6 +1434,211 @@ async def run_map_pcoa(body: dict):
     }
 
 
+@app.get("/api/datasets/{safe_name}/ranges")
+async def get_dataset_ranges(safe_name: str):
+    """m/z and RT ranges parsed from feature labels (ID_mz@RT) — used as heatmap filter bounds."""
+    dataset_dir = DATASETS_DIR / safe_name
+    if not dataset_dir.exists():
+        raise HTTPException(404, "Dataset not found")
+
+    _, ft = get_cached_dataset(safe_name, dataset_dir)
+    if ft is None:
+        raise HTTPException(404, "Feature table missing")
+
+    parsed = [_parse_feature_parts(str(i)) for i in ft.index]
+    valid_mz = [mz for _, mz, _ in parsed if mz is not None]
+    valid_rt = [rt for _, _, rt in parsed if rt is not None]
+    return {
+        "mz_min": float(min(valid_mz)) if valid_mz else 0.0,
+        "mz_max": float(max(valid_mz)) if valid_mz else 10000.0,
+        "rt_min": float(min(valid_rt)) if valid_rt else 0.0,
+        "rt_max": float(max(valid_rt)) if valid_rt else 10000.0,
+    }
+
+
+@app.get("/api/datasets/{safe_name}/heatmap")
+async def get_dataset_heatmap(
+    safe_name: str,
+    row_id_filter: str = "",
+    mz_min: float = 0.0,
+    mz_max: float = 10000.0,
+    rt_min: float = 0.0,
+    rt_max: float = 10000.0,
+    attribute: str = "",
+    categories: str = "",
+    samples: str = "",
+    cmap: str = "viridis",
+):
+    """Intensity heatmap rendered as a Matplotlib PNG (returned as base64 JSON).
+
+    FBMN-STATS style filtering:
+      attribute/categories/samples -> metadata-driven sample selection
+      row_id_filter/mz/rt          -> feature selection
+      cmap                         -> heatmap color palette
+    """
+    dataset_dir = DATASETS_DIR / safe_name
+    if not dataset_dir.exists():
+        raise HTTPException(404, "Dataset not found")
+
+    cmap_name = str(cmap).strip().lower()
+    if cmap_name not in HEATMAP_COLORMAPS:
+        cmap_name = "viridis"
+
+    mtime_md, mtime_ft = _dataset_mtimes(dataset_dir)
+
+    # The clustered/reordered matrix depends on every filter EXCEPT the color
+    # palette — cache it so palette swaps (and repeat requests) skip the
+    # O(n^2) hierarchical clustering and label parsing entirely.
+    cluster_key = (
+        safe_name, mtime_md, mtime_ft,
+        str(attribute), str(categories), str(samples),
+        row_id_filter.strip().lower(),
+        float(mz_min), float(mz_max), float(rt_min), float(rt_max),
+    )
+    cluster = HEATMAP_CLUSTER_CACHE.get(cluster_key)
+
+    if cluster is None:
+        md, ft = get_cached_dataset(safe_name, dataset_dir)
+        if md is None or ft is None:
+            raise HTTPException(400, "Dataset files missing")
+
+        md.index = md.index.astype(str)
+        ft.columns = [str(c) for c in ft.columns]
+        ft.index = ft.index.astype(str)
+
+        # --- Attribute → category → sample filtering (FBMN-STATS style) ---
+        filtered_md = md
+        title_suffix = ""
+        if attribute and attribute in md.columns:
+            filtered_md = md[md[attribute].notna()]
+            cat_list = [c.strip() for c in categories.split(",") if c.strip()] if categories else []
+            if cat_list:
+                filtered_md = filtered_md[filtered_md[attribute].astype(str).isin(cat_list)]
+            title_suffix += f" | {attribute} ({len(cat_list) if cat_list else 'all'} groups)"
+
+        if samples:
+            sample_list = [s.strip() for s in samples.split(",") if s.strip()]
+            if sample_list:
+                filtered_md = filtered_md[filtered_md.index.isin(sample_list)]
+
+        sample_cols = [c for c in ft.columns if c in filtered_md.index]
+        if len(sample_cols) < 2 or ft.shape[0] < 2:
+            raise HTTPException(400, f"Insufficient data for heatmap: {len(sample_cols)} sample(s) after filtering (need at least 2).")
+
+        # --- Feature filtering, vectorized over cached parsed labels ---
+        parts = _get_feature_parts(safe_name, ft, mtime_ft)
+        mask = np.ones(len(ft.index), dtype=bool)
+        if row_id_filter and row_id_filter.strip():
+            q = row_id_filter.strip().lower()
+            mask &= np.array([q in rid for rid in parts["row_ids"]], dtype=bool)
+        mz_arr, rt_arr = parts["mz"], parts["rt"]
+        mask &= np.isnan(mz_arr) | ((mz_arr >= mz_min) & (mz_arr <= mz_max))
+        mask &= np.isnan(rt_arr) | ((rt_arr >= rt_min) & (rt_arr <= rt_max))
+
+        filtered_indices = ft.index[mask]
+        features_total = int(len(filtered_indices))
+        if features_total < 1:
+            raise HTTPException(400, "No features match filter criteria")
+
+        # Cap features sent to clustering — linkage is O(n^2) in both time and
+        # memory, so very large feature sets would otherwise stall the request.
+        capped = False
+        if features_total > HEATMAP_MAX_FEATURES:
+            mean_intensity = ft.loc[filtered_indices, sample_cols].mean(axis=1)
+            filtered_indices = mean_intensity.nlargest(HEATMAP_MAX_FEATURES).index
+            capped = True
+
+        ft_sub = ft.loc[filtered_indices, sample_cols].fillna(0.0)
+
+        try:
+            # Cluster using log-transformed data
+            cluster_data = np.log10(ft_sub + 1)
+            if ft_sub.shape[0] >= 2:
+                cluster_ft = dendrogram(linkage(cluster_data, method="complete", metric="euclidean"), no_plot=True)
+                ft_order = cluster_ft["leaves"]
+            else:
+                ft_order = list(range(ft_sub.shape[0]))
+            cluster_samples = dendrogram(linkage(cluster_data.T, method="complete", metric="euclidean"), no_plot=True)
+
+            # Reorder data using cluster leaves
+            ord_ft = ft_sub.iloc[ft_order, cluster_samples["leaves"]]
+        except Exception as e:
+            raise HTTPException(500, f"Heatmap clustering failed: {str(e)}")
+
+        # Prepare title
+        if row_id_filter:
+            title_suffix += f" | Row ID: {row_id_filter}"
+        if mz_min > 0 or mz_max < 10000:
+            title_suffix += f" | m/z: {mz_min:.1f}-{mz_max:.1f}"
+        if rt_min > 0 or rt_max < 10000:
+            title_suffix += f" | RT: {rt_min:.1f}-{rt_max:.1f}"
+        if capped:
+            title_suffix += f" | top {HEATMAP_MAX_FEATURES:,} of {features_total:,} features"
+
+        cluster = {
+            "ord_ft": ord_ft,
+            "title_suffix": title_suffix,
+            "n_features": int(ord_ft.shape[0]),
+            "n_samples": len(sample_cols),
+            "features_total": features_total,
+            "capped": capped,
+        }
+        # Bound memory: drop stale entries for this dataset, then cap total size (FIFO).
+        for k in [k for k in HEATMAP_CLUSTER_CACHE if k[0] == safe_name]:
+            HEATMAP_CLUSTER_CACHE.pop(k, None)
+        while len(HEATMAP_CLUSTER_CACHE) >= HEATMAP_CLUSTER_CACHE_MAX:
+            HEATMAP_CLUSTER_CACHE.pop(next(iter(HEATMAP_CLUSTER_CACHE)))
+        HEATMAP_CLUSTER_CACHE[cluster_key] = cluster
+
+    ord_ft = cluster["ord_ft"]
+    title_suffix = cluster["title_suffix"]
+
+    try:
+        # Generate Matplotlib heatmap
+        fig, ax = plt.subplots(figsize=(12, 8), dpi=100)
+        im = ax.imshow(ord_ft.values, cmap=cmap_name, aspect='auto', interpolation='nearest')
+
+        ax.set_xlabel("Samples", fontsize=10)
+        ax.set_ylabel("Metabolites", fontsize=10)
+        ax.set_title(f"Intensity Heatmap: {safe_name}{title_suffix}", fontsize=12, pad=10)
+
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Intensity', fontsize=9)
+
+        # Set tick labels (simplified for large datasets)
+        n_samples = len(ord_ft.columns)
+        n_features = len(ord_ft.index)
+        sample_step = max(1, n_samples // 10)
+        feature_step = max(1, n_features // 10)
+
+        ax.set_xticks(range(0, n_samples, sample_step))
+        ax.set_xticklabels([ord_ft.columns[i] for i in range(0, n_samples, sample_step)], rotation=45, ha='right', fontsize=7)
+        ax.set_yticks(range(0, n_features, feature_step))
+        ax.set_yticklabels([str(ord_ft.index[i]).split('&')[0] for i in range(0, n_features, feature_step)], fontsize=7)
+
+        plt.tight_layout()
+
+        # Render to PNG in memory
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+
+        # Return as base64 data URI so the frontend can render it in an <img> tag
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return {
+            "image": f"data:image/png;base64,{img_b64}",
+            "title": f"Intensity Heatmap: {safe_name}{title_suffix}",
+            "features": cluster["n_features"],
+            "samples": cluster["n_samples"],
+            "features_total": cluster["features_total"],
+            "features_capped": cluster["capped"],
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Heatmap generation failed: {str(e)}")
+
+
 def _formula_from_inchi(inchi: str) -> Optional[str]:
     """Extract the molecular formula layer from an InChI string."""
     if not isinstance(inchi, str):
@@ -1487,8 +1846,8 @@ async def get_dataset_vankrevelen(
 
     an = pd.read_parquet(an_path)
     ft = pd.read_parquet(ft_path)
-    md = pd.read_parquet(md_path) if md_path.exists() else pd.DataFrame()
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    md = _public_md(pd.read_parquet(md_path), meta) if md_path.exists() else pd.DataFrame()
 
     if ft.empty:
         return {"points": [], "total_points": 0, "total_features": 0}
@@ -1616,8 +1975,8 @@ async def get_dataset_carbon_ox_state(safe_name: str, show_msbuddy: bool = False
 
     an = pd.read_parquet(an_path)
     ft = pd.read_parquet(ft_path)
-    md = pd.read_parquet(md_path) if md_path.exists() else pd.DataFrame()
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    md = _public_md(pd.read_parquet(md_path), meta) if md_path.exists() else pd.DataFrame()
 
     if ft.empty:
         return {"points": [], "total_points": 0, "total_features": 0}

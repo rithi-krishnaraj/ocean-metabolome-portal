@@ -1,4 +1,16 @@
 const BASE = '/api'
+const TOKEN_KEY = 'adminToken'
+
+// Admin token from /admin/login, kept for this browser tab only.
+export const getAdminToken = () => {
+  try { return sessionStorage.getItem(TOKEN_KEY) } catch { return null }
+}
+export const clearAdminToken = () => {
+  try { sessionStorage.removeItem(TOKEN_KEY) } catch { /* storage unavailable */ }
+}
+const setAdminToken = (token) => {
+  try { sessionStorage.setItem(TOKEN_KEY, token) } catch { /* storage unavailable */ }
+}
 
 async function req(method, path, body) {
   const opts = { method, headers: {} }
@@ -8,25 +20,37 @@ async function req(method, path, body) {
     opts.headers['Content-Type'] = 'application/json'
     opts.body = JSON.stringify(body)
   }
+  const token = getAdminToken()
+  if (token) opts.headers.Authorization = `Bearer ${token}`
+
   const res = await fetch(BASE + path, opts)
   const data = await res.json().catch(() => ({}))
+  if (res.status === 401 && token) {
+    // Token expired or the server restarted: drop it so the admin page asks to log in again.
+    clearAdminToken()
+    window.dispatchEvent(new Event('admin-unauthorized'))
+  }
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
   return data
 }
 
-// Upload
+// Admin auth
+export const adminLogin = async (password) => {
+  const data = await req('POST', '/admin/login', { password })
+  setAdminToken(data.token)
+  return data
+}
+
+// Upload (admin)
 export const uploadManual = (formData) => req('POST', '/upload/manual', formData)
 export const uploadGnps = (task_id, workflow) => req('POST', '/upload/gnps', { task_id, workflow })
-
-// Session
-export const getSessionMdInfo = (id) => req('GET', `/session/${id}/md-info`)
-export const blankRemovalPreview = (id, body) => req('POST', `/session/${id}/blank-removal-preview`, body)
 
 // Dataset management
 export const saveDataset = (body) => req('POST', '/dataset/save', body)
 export const listDatasets = () => req('GET', '/datasets')
 export const deleteDataset = (safeName) => req('DELETE', `/datasets/${safeName}`)
-export const getDatasetTable = (safeName, table) => req('GET', `/datasets/${safeName}/table/${table}`)
+export const getDatasetSettings = (safeName) => req('GET', `/datasets/${safeName}/settings`)
+export const updateDataset = (safeName, changes) => req('PATCH', `/datasets/${safeName}`, changes)
 
 // Map
 export const getMapData = () => req('GET', '/map/data')
@@ -49,6 +73,3 @@ export const getVanKrevelenData = (safeName, showMsbuddy = false) =>
   req('GET', `/datasets/${safeName}/vankrevelen${showMsbuddy ? '?show_msbuddy=true' : ''}`)
 export const getCarbonOxStateData = (safeName, showMsbuddy = false) =>
   req('GET', `/datasets/${safeName}/carbon-ox-state${showMsbuddy ? '?show_msbuddy=true' : ''}`)
-export const getFormulaCoverage = (safeName) => req('GET', `/datasets/${safeName}/formula-coverage`)
-export const runDatasetAnnotation = (safeName, body) => req('POST', `/datasets/${safeName}/annotate`, body)
-export const getUnannotatedCount = (safeName) => req('GET', `/datasets/${safeName}/unannotated-count`)

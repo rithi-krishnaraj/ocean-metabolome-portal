@@ -1,9 +1,8 @@
 import { useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import { Globe, Settings, RotateCcw } from 'lucide-react'
-import AdminPage from './pages/AdminPage'
 import MapPage from './pages/MapPage'
-import AdminAuthWrapper from './components/AdminAuthWrapper'; // Import the new component
+import AdminAuthWrapper from './components/AdminAuthWrapper'
 
 export default function App() {
   return (
@@ -98,7 +97,7 @@ function AppShell() {
               />
             }
           />
-          <Route path="/admin" element={<AdminAuthWrapper />} /> {/* Use the wrapper here */}
+          <Route path="/admin" element={<AdminAuthWrapper />} />
         </Routes>
       </div>
     </div>

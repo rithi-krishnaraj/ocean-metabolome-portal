@@ -1,10 +1,11 @@
-﻿import { useEffect, useState, useMemo, useCallback, useRef } from 'react'
+﻿import { useEffect, useState, useMemo, useCallback, useRef, useDeferredValue, memo } from 'react'
 import DeckGL from '@deck.gl/react'
 import { ScatterplotLayer } from '@deck.gl/layers'
 import MapLibreMap from 'react-map-gl/maplibre'
-import 'maplibre-gl/dist/maplibre-gl.css'
+import maplibregl from 'maplibre-gl'
 import StatsPanel from '../components/StatsPanel'
-import Plot from 'react-plotly.js'
+import Plotly from 'plotly.js-dist-min'
+import createPlotlyComponent from 'react-plotly.js/factory'
 import { 
   getMapData, 
   getMapSampleDetails, 
@@ -15,14 +16,149 @@ import {
   getBoxplotData,
   getVanKrevelenData,
   getCarbonOxStateData,
-  getFormulaCoverage,
-  runDatasetAnnotation,
-  getUnannotatedCount
 } from '../api'
 import { Filter, X, RefreshCw, AlertTriangle, BarChart3, Grid, Layers, Sliders, Flame, ChevronDown, ChevronRight } from 'lucide-react'
 
-// Free CARTO dark basemap â€” no API key required
-const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
+const Plot = createPlotlyComponent(Plotly)
+
+// Plotly fully redraws whenever it gets new data/layout objects, and the chart props in MapPage
+// are rebuilt on every render (each map hover, keystroke or legend drag). CachedPlot passes new
+// props through only when one of `deps` (the chart's real inputs) changes.
+const CachedPlot = memo(
+  function CachedPlot({ deps, ...plotProps }) {
+    return <Plot {...plotProps} />
+  },
+  (prev, next) => prev.className === next.className
+    && prev.deps.length === next.deps.length
+    && prev.deps.every((dep, i) => Object.is(dep, next.deps[i])),
+)
+
+// Rows rendered at once in the hovered sample's feature list (a sample can have thousands)
+const HOVER_FEATURE_PAGE = 200
+
+// Basemaps (all free, no API key). Change BASEMAP to switch; 'carto-dark' is the original map.
+const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services'
+const esriSource = (service, maxzoom, attribution = '') => ({
+  type: 'raster',
+  tiles: [`${ESRI}/${service}/MapServer/tile/{z}/{y}/{x}`],
+  tileSize: 256,
+  maxzoom,
+  attribution,
+})
+const ESRI_LABELS = esriSource('Reference/World_Boundaries_and_Places', 19, 'Labels &copy; Esri')
+
+// Esri's label tiles are pre-drawn light text with dark halos (made for imagery). Tiles requested
+// as blacklabels://... are recoloured per pixel: bright text and borders become black, halos white.
+maplibregl.addProtocol('blacklabels', async (params, abortController) => {
+  const res = await fetch(params.url.replace('blacklabels://', 'https://'), { signal: abortController.signal })
+  const bitmap = await createImageBitmap(await res.blob())
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height)
+  const ctx = canvas.getContext('2d')
+  ctx.drawImage(bitmap, 0, 0)
+  const image = ctx.getImageData(0, 0, bitmap.width, bitmap.height)
+  const px = image.data
+  for (let i = 0; i < px.length; i += 4) {
+    // Brightest channel, so coloured text (e.g. cyan sea names) counts as bright too
+    const v = Math.max(px[i], px[i + 1], px[i + 2]) / 255
+    px[i] = px[i + 1] = px[i + 2] = Math.round(255 * Math.min(1, Math.max(0, (0.65 - v) / 0.35)))
+  }
+  ctx.putImageData(image, 0, 0)
+  return { data: await (await canvas.convertToBlob()).arrayBuffer() }
+})
+const ESRI_LABELS_BLACK = {
+  ...ESRI_LABELS,
+  tiles: ESRI_LABELS.tiles.map((url) => url.replace('https://', 'blacklabels://')),
+}
+const rasterStyle = (imagery, labels = ESRI_LABELS) => ({
+  version: 8,
+  sources: { imagery, labels },
+  layers: [
+    { id: 'imagery', type: 'raster', source: 'imagery' },
+    { id: 'labels', type: 'raster', source: 'labels' },
+  ],
+})
+
+const BASEMAPS = {
+  // Original: dark vector map from CARTO
+  'carto-dark': {
+    style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+    outlinePoints: false,
+  },
+  // Same dark map, but every label (oceans, seas, cities, roads) shown in English
+  'carto-dark-english': {
+    style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+    englishLabels: true,
+    outlinePoints: false,
+  },
+  // Esri World Imagery: true-colour satellite down to street level, bathymetry-shaded ocean, English labels
+  'esri-satellite': {
+    style: rasterStyle({
+      type: 'raster',
+      tiles: [`${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`],
+      tileSize: 256,
+      maxzoom: 19,
+      attribution: 'Powered by Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community',
+    }),
+    outlinePoints: true,
+  },
+  // NASA Blue Marble: public-domain true colour with bathymetry, but blurry past zoom 8
+  'nasa-blue-marble': {
+    style: rasterStyle({
+      type: 'raster',
+      tiles: ['https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpeg'],
+      tileSize: 256,
+      maxzoom: 8,
+      attribution: 'Imagery: NASA Blue Marble (GIBS)',
+    }),
+    outlinePoints: true,
+  },
+  // Esri Ocean: blue bathymetry, muted land; black English labels for oceans, seas, countries and cities
+  'esri-ocean': {
+    style: rasterStyle(
+      esriSource('Ocean/World_Ocean_Base', 16, 'Esri, GEBCO, NOAA, National Geographic, DeLorme, HERE, Geonames.org, and other contributors'),
+      ESRI_LABELS_BLACK,
+    ),
+    outlinePoints: true,
+  },
+  // Same, with Esri's ocean labels: names trenches, ridges and seamounts, but also prints depth soundings
+  'esri-ocean-depths': {
+    style: rasterStyle(
+      esriSource('Ocean/World_Ocean_Base', 16, 'Esri, GEBCO, NOAA, National Geographic, DeLorme, HERE, Geonames.org, and other contributors'),
+      esriSource('Ocean/World_Ocean_Reference', 16),
+    ),
+    outlinePoints: true,
+  },
+  // Esri Dark Gray Canvas: near-monochrome dark map with dense English place labels
+  'esri-dark-gray': {
+    style: rasterStyle(
+      esriSource('Canvas/World_Dark_Gray_Base', 16, 'Esri, HERE, Garmin, &copy; OpenStreetMap contributors, and the GIS user community'),
+      esriSource('Canvas/World_Dark_Gray_Reference', 16),
+    ),
+    outlinePoints: false,
+  },
+  // Esri Light Gray Canvas: near-monochrome light map with dense English place labels
+  'esri-light-gray': {
+    style: rasterStyle(
+      esriSource('Canvas/World_Light_Gray_Base', 16, 'Esri, HERE, Garmin, &copy; OpenStreetMap contributors, and the GIS user community'),
+      esriSource('Canvas/World_Light_Gray_Reference', 16),
+    ),
+    outlinePoints: true,
+  },
+}
+const BASEMAP = BASEMAPS['carto-dark-english']
+
+// CARTO's style shows local names for oceans, seas and roads (e.g. "日本海 Японское море"), and for
+// cities when zoomed in. Rewrite every label to the English name, falling back to the local one.
+async function loadEnglishStyle(url) {
+  const style = await (await fetch(url)).json()
+  for (const layer of style.layers) {
+    const field = layer.layout?.['text-field']
+    if (field && JSON.stringify(field).includes('"name')) {
+      layer.layout['text-field'] = ['coalesce', ['get', 'name:en'], ['get', 'name']]
+    }
+  }
+  return style
+}
 
 const INITIAL_VIEW = {
   longitude: 0,
@@ -33,17 +169,42 @@ const INITIAL_VIEW = {
 }
 
 // Deterministic colour from a string
-function strColor(str) {
-  let h = 0
-  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0
-  const hue = h % 360
-  const s = 0.75, l = 0.6
+function hslToRgb(hue, s = 0.75, l = 0.6) {
   const a = s * Math.min(l, 1 - l)
   const f = (n) => {
     const k = (n + hue / 30) % 12
     return Math.round((l - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)))) * 255)
   }
   return [f(0), f(8), f(4)]
+}
+
+function strColor(str) {
+  let h = 0
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0
+  return hslToRgb(h % 360)
+}
+
+// Distinct colours for categories (datasets, metadata values), readable on the dark basemap.
+const CATEGORY_PALETTE = [
+  [56, 189, 248],   // sky
+  [251, 146, 60],   // orange
+  [74, 222, 128],   // green
+  [244, 114, 182],  // pink
+  [250, 204, 21],   // yellow
+  [167, 139, 250],  // violet
+  [45, 212, 191],   // teal
+  [248, 113, 113],  // red
+  [163, 230, 53],   // lime
+  [96, 165, 250],   // blue
+  [232, 121, 249],  // fuchsia
+  [253, 224, 171],  // sand
+]
+
+// Colour for the i-th category: palette first, then golden-angle hues so
+// neighbouring categories stay far apart however many there are.
+function categoryColor(index) {
+  if (index < CATEGORY_PALETTE.length) return CATEGORY_PALETTE[index]
+  return hslToRgb(((index - CATEGORY_PALETTE.length) * 137.508 + 20) % 360)
 }
 
 // Sequential cool→warm ramp for intensity; returns [r, g, b] for t in [0, 1].
@@ -90,7 +251,7 @@ function getPointSampleKey(p, datasetSafeMap) {
   return `${datasetSafe}::${sampleId}`
 }
 
-function describeActiveSampleFilters(filters, selectedSamples, sampleSearch) {
+function describeActiveSampleFilters(filters, selectedSamples) {
   const parts = []
   for (const [col, values] of Object.entries(filters)) {
     if (!values || values.size === 0) continue
@@ -102,9 +263,6 @@ function describeActiveSampleFilters(filters, selectedSamples, sampleSearch) {
   if (selectedSamples.size > 0) {
     parts.push(`Samples: ${selectedSamples.size} selected`)
   }
-  if (sampleSearch.trim()) {
-    parts.push(`Search: "${sampleSearch.trim()}"`)
-  }
   return parts.length ? parts.join('; ') : 'none'
 }
 
@@ -115,9 +273,19 @@ export default function MapPage({
   resetTrigger = 0,
 }) {
   const [mapData, setMapData] = useState(null)
+  const [mapStyle, setMapStyle] = useState(BASEMAP.englishLabels ? null : BASEMAP.style)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [tooltip, setTooltip] = useState(null)
+
+  useEffect(() => {
+    if (!BASEMAP.englishLabels) return
+    let cancelled = false
+    loadEnglishStyle(BASEMAP.style)
+      .then((style) => { if (!cancelled) setMapStyle(style) })
+      .catch(() => { if (!cancelled) setMapStyle(BASEMAP.style) }) // fall back to the unmodified style
+    return () => { cancelled = true }
+  }, [])
   const [hoverPoint, setHoverPoint] = useState(null)
   const [hoverTab, setHoverTab] = useState('metadata')
   const [hoverMetabolites, setHoverMetabolites] = useState([])
@@ -146,6 +314,7 @@ export default function MapPage({
   const [selectedFeature, setSelectedFeature] = useState(null)
   const [mapFeature, setMapFeature] = useState(null)
   const [metaboliteSampleKeys, setMetaboliteSampleKeys] = useState(new Set())
+  const [metaboliteMeasuredSamples, setMetaboliteMeasuredSamples] = useState({})
   const [intensityScale, setIntensityScale] = useState('log')
   const metaboliteSearchTimerRef = useRef(null)
 
@@ -161,6 +330,7 @@ export default function MapPage({
   const legendDragOffset = useRef({ x: 0, y: 0 })
   const hoverClearTimeoutRef = useRef(null)
   const hoverDetailsCacheRef = useRef(new globalThis.Map())
+  const keepHoverTabRef = useRef(false)
   const colorByRef = useRef(colorBy)
   const colorLookupRef = useRef(new globalThis.Map())
   const colorByForAfterRender = useRef(colorBy)
@@ -180,7 +350,6 @@ export default function MapPage({
   const [pcoaError, setPcoaError] = useState('')
   const [pcoaActiveTab, setPcoaActiveTab] = useState('plot')
   const [pcoaDashboardExpanded, setPcoaDashboardExpanded] = useState(true)
-  const [pcoaTooltip, setPcoaTooltip] = useState(null)
 
   const [pcoaMetadataColumns, setPcoaMetadataColumns] = useState([])
   const [pcoaAllCategories, setPcoaAllCategories] = useState([])
@@ -227,6 +396,11 @@ export default function MapPage({
   const [carbonOxStateSearch, setCarbonOxStateSearch] = useState('')
   const [carbonOxStateSelectedCategories, setCarbonOxStateSelectedCategories] = useState([])
   const [carbonOxStateAllCategories, setCarbonOxStateAllCategories] = useState([])
+  const [carbonOxStateShowMsbuddy, setCarbonOxStateShowMsbuddy] = useState(false)
+  // Charts filter on deferred copies of the search text, so typing stays responsive while they redraw
+  const vankrevelenSearchDeferred = useDeferredValue(vankrevelenSearch)
+  const carbonOxStateSearchDeferred = useDeferredValue(carbonOxStateSearch)
+  const [hoverFeatureLimit, setHoverFeatureLimit] = useState(HOVER_FEATURE_PAGE)
 
   const pcoaSamplesByGroup = useMemo(() => {
     if (!pcoaAllSamples || !pcoaAttribute) return {}
@@ -399,9 +573,6 @@ export default function MapPage({
     }
   }, [pcoaDatasetSafe])
 
-  // Expose a way to bust the cache when needed (e.g. after backend restart)
-  const bustCache = () => { hoverDetailsCacheRef.current.clear() }
-
   // Boxplot Logic
   useEffect(() => {
     if (boxplotDatasetSafe) {
@@ -516,7 +687,7 @@ export default function MapPage({
     setCarbonOxStateLoading(true)
     setCarbonOxStateError('')
     try {
-      const data = await getCarbonOxStateData(carbonOxStateDatasetSafe)
+      const data = await getCarbonOxStateData(carbonOxStateDatasetSafe, carbonOxStateShowMsbuddy)
       setCarbonOxStateResult(data)
     } catch (err) {
       setCarbonOxStateError(err.message || 'Failed to fetch Carbon Oxidation State data.')
@@ -524,7 +695,7 @@ export default function MapPage({
     } finally {
       setCarbonOxStateLoading(false)
     }
-  }, [carbonOxStateDatasetSafe])
+  }, [carbonOxStateDatasetSafe, carbonOxStateShowMsbuddy])
 
   // Clear stale result when dataset changes
   useEffect(() => {
@@ -578,7 +749,9 @@ export default function MapPage({
         has_annotation: false,
       })
       setMetaboliteMatches([])
+      setMetaboliteMeasuredSamples({})
       setMetaboliteMatchesError('')
+      setMapFeature(null)
     }
   }, [resetTrigger])
 
@@ -768,19 +941,21 @@ export default function MapPage({
   }, [mapData?.points])
 
   // Precompute colours for selected category values so recolouring is immediate.
+  // Each value (e.g. each dataset) gets its own palette colour, in sorted order;
+  // dataset values come from all points, so a dataset keeps its colour when filtering.
   const colorLookup = useMemo(() => {
     const lookup = new globalThis.Map()
-    for (const val of columnValues[colorBy] ?? []) {
-      lookup.set(val, strColor(val))
-    }
+    ;(columnValues[colorBy] ?? []).forEach((val, i) => {
+      lookup.set(val, categoryColor(i))
+    })
     colorByRef.current = colorBy
     colorLookupRef.current = lookup
     return lookup
   }, [columnValues, colorBy])
 
   // Intensity scale derived from the feature currently applied to the map,
-  // restricted to positive-intensity samples that remain visible after current filters.
-  // Zero-intensity samples are tracked separately and rendered grey.
+  // restricted to detected samples that remain visible after current filters.
+  // Measured samples without a detection are absent from byKey and rendered grey.
   const intensityInfo = useMemo(() => {
     if (!mapFeature?.present_samples?.length || metaboliteSampleKeys.size === 0) return null
     const values = []
@@ -790,9 +965,8 @@ export default function MapPage({
       const datasetSafe = String(s.dataset_safe ?? '').trim()
       const sampleId = String(s.sample_id ?? '').trim()
       const key = `${datasetSafe}::${sampleId}`
-      if (scaled === null) continue
+      if (scaled === null || scaled === 'zero') continue
       byKey.set(key, scaled)
-      if (scaled === 'zero') continue
       if (visiblePointKeys.size === 0 || visiblePointKeys.has(key)) {
         values.push(scaled)
       }
@@ -816,11 +990,8 @@ export default function MapPage({
         if (intensityActive) {
           const key = getPointSampleKey(d, mapData?.dataset_safe_map)
           const scaled = key ? intensityInfo.byKey.get(key) : undefined
-          if (scaled === 'zero') return [128, 128, 128]
-          if (scaled !== undefined && typeof scaled === 'number') {
-            const t = (scaled - intensityInfo.min) / intensityInfo.range
-            return intensityRamp(t)
-          }
+          if (typeof scaled !== 'number') return [128, 128, 128] // measured, not detected
+          return intensityRamp((scaled - intensityInfo.min) / intensityInfo.range)
         }
         const key = colorByRef.current ? String(d[colorByRef.current] ?? 'N/A') : String(d._dataset ?? 'N/A')
         return colorLookupRef.current.get(key) ?? strColor(key)
@@ -829,8 +1000,7 @@ export default function MapPage({
         if (!intensityActive) return 55000
         const key = getPointSampleKey(d, mapData?.dataset_safe_map)
         const scaled = key ? intensityInfo.byKey.get(key) : undefined
-        if (scaled === 'zero') return 30000
-        if (scaled === undefined || typeof scaled !== 'number') return 55000
+        if (typeof scaled !== 'number') return 30000
         const t = (scaled - intensityInfo.min) / intensityInfo.range
         const minR = 25000
         const maxR = 105000
@@ -839,6 +1009,11 @@ export default function MapPage({
       radiusUnits: 'meters',
       radiusMinPixels: 4,
       radiusMaxPixels: 24,
+      // Dark rim keeps points visible over bright imagery (ice, desert)
+      stroked: BASEMAP.outlinePoints,
+      getLineColor: [15, 23, 42],
+      lineWidthUnits: 'pixels',
+      getLineWidth: 1,
       pickable: true,
       opacity: 0.75,
       updateTriggers: {
@@ -853,7 +1028,8 @@ export default function MapPage({
 
         if (object) {
           setHoverPoint(object)
-          setTooltip({ object, x, y })
+          // Re-render only when the hovered point changes, not on every mouse move across it
+          setTooltip((t) => (t?.object === object ? t : { object, x, y }))
           return
         }
 
@@ -897,9 +1073,11 @@ export default function MapPage({
       return
     }
 
-    setHoverTab('metadata')
+    if (!keepHoverTabRef.current) setHoverTab('metadata')
+    keepHoverTabRef.current = false
     setMetaboliteSearch('')
     setMetaboliteSearchDebounced('')
+    setHoverFeatureLimit(HOVER_FEATURE_PAGE)
     if (!clickPinned) setHoverExpanded(false)
     const datasetSafe = resolveDatasetSafe(hoverPoint)
     const sampleIdHint = resolveSampleId(hoverPoint)
@@ -913,7 +1091,9 @@ export default function MapPage({
       return
     }
 
-    const cacheKey = `${datasetSafe}::${lat.toFixed(8)}::${lon.toFixed(8)}`
+    const cacheKey = sampleIdHint
+      ? `${datasetSafe}::${sampleIdHint}`
+      : `${datasetSafe}::${lat.toFixed(8)}::${lon.toFixed(8)}`
     if (hoverDetailsCacheRef.current.has(cacheKey)) {
       const cached = hoverDetailsCacheRef.current.get(cacheKey)
       setHoverMetabolites(cached.metabolites ?? [])
@@ -1007,36 +1187,24 @@ export default function MapPage({
     return { metadata }
   }, [tooltip])
 
-  const analysisSummary = useMemo(() => {
-    const visibleSamples = points.length
-    const visibleDatasets = new globalThis.Set(points.map((p) => String(p._dataset ?? 'N/A'))).size
+  // Samples plotted at exactly the same location as the hovered one (replicates or
+  // depth profiles at one station) sit on top of each other, so offer a picker.
+  const colocatedPoints = useMemo(() => {
+    if (!hoverPoint) return []
+    const lat = String(hoverPoint._lat)
+    const lon = String(hoverPoint._lon)
+    return points
+      .filter((p) => String(p._lat) === lat && String(p._lon) === lon)
+      .sort((a, b) => resolveSampleId(a).localeCompare(resolveSampleId(b)))
+  }, [hoverPoint, points, resolveSampleId])
 
-    const topColorGroups = Object.entries(
-      points.reduce((acc, p) => {
-        const key = String(p[colorBy] ?? 'N/A')
-        acc[key] = (acc[key] ?? 0) + 1
-        return acc
-      }, {})
-    )
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-
-    const intensityValues = hoverMetabolites
-      .map((m) => Number(m.intensity))
-      .filter((v) => Number.isFinite(v))
-
-    const meanIntensity = intensityValues.length
-      ? intensityValues.reduce((sum, v) => sum + v, 0) / intensityValues.length
-      : null
-
-    return {
-      visibleSamples,
-      visibleDatasets,
-      topColorGroups,
-      meanIntensity,
-      metabolitesInSelectedSample: hoverMetabolites.length,
-    }
-  }, [points, colorBy, hoverMetabolites])
+  const selectColocatedSample = (sampleKey) => {
+    const next = colocatedPoints.find((p) => getPointSampleKey(p, mapData?.dataset_safe_map) === sampleKey)
+    if (!next) return
+    keepHoverTabRef.current = true
+    setHoverPoint(next)
+    setTooltip((t) => ({ ...(t ?? { x: 0, y: 0 }), object: next }))
+  }
 
   const runMetaboliteFilter = async () => {
     setMetaboliteMatchesLoading(true)
@@ -1049,6 +1217,7 @@ export default function MapPage({
         limit: 500,
       })
       setMetaboliteMatches(data?.features ?? [])
+      setMetaboliteMeasuredSamples(data?.measured_samples ?? {})
     } catch (e) {
       setMetaboliteMatches([])
       setMetaboliteMatchesError(e.message || 'Failed to run metabolite filtering.')
@@ -1058,9 +1227,10 @@ export default function MapPage({
   }
 
   const applyFeatureMapFilter = (feature) => {
-    const keys = new Set(
-      (feature.present_samples ?? []).map((s) => `${String(s.dataset_safe)}::${String(s.sample_id)}`)
-    )
+    // Show every measured sample of the feature's dataset; undetected ones render grey.
+    const measured = metaboliteMeasuredSamples[feature.dataset_safe]
+      ?? (feature.present_samples ?? []).map((s) => s.sample_id)
+    const keys = new Set(measured.map((id) => `${String(feature.dataset_safe)}::${String(id)}`))
     setMetaboliteSampleKeys(keys)
     setMapFeature(feature)
     setSelectedFeature(feature)
@@ -1293,7 +1463,8 @@ export default function MapPage({
               <h4 className="text-xs font-semibold text-slate-200 mb-2 truncate px-2">
                 Intensity Comparison: {boxplotMetabolite} {boxplotGroupBy ? `grouped by ${boxplotGroupBy}` : ''}
               </h4>
-              <Plot
+              <CachedPlot
+                deps={[boxplotResult, boxplotGroupBy, boxplotMetabolite]}
                 data={(() => {
                   if (!boxplotGroupBy) {
                     return [{
@@ -1344,8 +1515,7 @@ export default function MapPage({
                     linecolor: '#cbd5e1',
                   },
                   yaxis: {
-                    title: 'Intensity',
-                    titlefont: { size: 12, color: '#1e293b', standoff: 15 },
+                    title: { text: 'Intensity', font: { size: 12, color: '#1e293b' }, standoff: 15 },
                     tickfont: { size: 10, color: '#334155' },
                     gridcolor: '#f1f5f9',
                     zerolinecolor: '#e2e8f0'
@@ -1379,8 +1549,8 @@ export default function MapPage({
 
     // Next, filter by search keyword
     const filteredPoints = categoryFilteredPoints.filter(p => {
-      if (!vankrevelenSearch) return true
-      const q = vankrevelenSearch.toLowerCase()
+      if (!vankrevelenSearchDeferred) return true
+      const q = vankrevelenSearchDeferred.toLowerCase()
       return (
         p.metabolite.toLowerCase().includes(q) ||
         p.formula.toLowerCase().includes(q) ||
@@ -1501,6 +1671,16 @@ export default function MapPage({
             />
           </div>
 
+          <label className="flex items-start gap-2 text-[10px] text-slate-300 cursor-pointer select-none leading-tight">
+            <input
+              type="checkbox"
+              checked={vankrevelenShowMsbuddy}
+              onChange={(e) => setVankrevelenShowMsbuddy(e.target.checked)}
+              className="rounded scale-90 accent-ocean-500 mt-0.5"
+            />
+            <span>Include MSBuddy-predicted formulas (m/z-only, lowest confidence)</span>
+          </label>
+
           <button
             onClick={runVanKrevelenAnalysis}
             disabled={vankrevelenLoading || !vankrevelenDatasetSafe}
@@ -1557,7 +1737,7 @@ export default function MapPage({
           {!vankrevelenError && vankrevelenResult && (
             <div className="rounded bg-slate-850 border border-slate-800 p-2.5 text-[11px] text-slate-400 space-y-1 font-sans mt-3">
               <p className="font-semibold text-slate-300">Van Krevelen Statistics</p>
-              <p>SIRIUS Annotated Features: <span className="text-emerald-400 font-medium">{vankrevelenResult.annotated_features ?? 0}</span></p>
+              <p>Features with a molecular formula: <span className="text-emerald-400 font-medium">{vankrevelenResult.annotated_features ?? 0}</span></p>
               <p>Filtered points (via search): <span className="text-slate-200 font-medium">{filteredPoints.length}</span></p>
               <p>Unique color groups: <span className="text-slate-200 font-medium">{Object.keys(groups).length}</span></p>
             </div>
@@ -1573,7 +1753,7 @@ export default function MapPage({
                 Retrieving Annotated Features...
               </p>
               <p className="text-[10px] text-slate-500 max-w-[200px]">
-                Getting the top 1000 highest abundance features matching your precomputed SIRIUS annotations.
+                Getting the 1000 most abundant features that have a molecular formula.
               </p>
             </div>
           ) : !vankrevelenResult ? (
@@ -1589,7 +1769,8 @@ export default function MapPage({
               </div>
             </div>
           ) : filteredPoints.length > 0 ? (
-            <Plot
+            <CachedPlot
+              deps={[vankrevelenResult, vankrevelenSelectedCategories, vankrevelenFilterBy, vankrevelenSearchDeferred, vankrevelenColorBy, vankrevelenDatasetSafe]}
               data={plotlyData}
               layout={{
                 autosize: true,
@@ -1597,7 +1778,7 @@ export default function MapPage({
                 plot_bgcolor: 'white',
                 font: { color: '#334155', size: 10 },
                 title: {
-                  text: `VAN KREVELEN PLOT (${vankrevelenDatasetSafe.replace('_', ' ')})`,
+                  text: `VAN KREVELEN PLOT (${vankrevelenDatasetSafe.replaceAll('_', ' ')})`,
                   font: { color: '#0f172a', size: 12, weight: 'bold' }
                 },
                 xaxis: {
@@ -1649,8 +1830,8 @@ export default function MapPage({
 
     // Next, filter by search keyword
     const filteredPoints = categoryFilteredPoints.filter(p => {
-      if (!carbonOxStateSearch) return true
-      const q = carbonOxStateSearch.toLowerCase()
+      if (!carbonOxStateSearchDeferred) return true
+      const q = carbonOxStateSearchDeferred.toLowerCase()
       return (
         p.metabolite.toLowerCase().includes(q) ||
         p.formula.toLowerCase().includes(q) ||
@@ -1771,6 +1952,16 @@ export default function MapPage({
             />
           </div>
 
+          <label className="flex items-start gap-2 text-[10px] text-slate-300 cursor-pointer select-none leading-tight">
+            <input
+              type="checkbox"
+              checked={carbonOxStateShowMsbuddy}
+              onChange={(e) => setCarbonOxStateShowMsbuddy(e.target.checked)}
+              className="rounded scale-90 accent-ocean-500 mt-0.5"
+            />
+            <span>Include MSBuddy-predicted formulas (m/z-only, lowest confidence)</span>
+          </label>
+
           <button
             onClick={runCarbonOxStateAnalysis}
             disabled={carbonOxStateLoading || !carbonOxStateDatasetSafe}
@@ -1827,7 +2018,7 @@ export default function MapPage({
           {!carbonOxStateError && carbonOxStateResult && (
             <div className="rounded bg-slate-850 border border-slate-800 p-2.5 text-[11px] text-slate-400 space-y-1 font-sans mt-3">
               <p className="font-semibold text-slate-300">Carbon Oxidation State Statistics</p>
-              <p>SIRIUS Annotated Features: <span className="text-emerald-400 font-medium">{carbonOxStateResult.annotated_features ?? 0}</span></p>
+              <p>Features with a molecular formula: <span className="text-emerald-400 font-medium">{carbonOxStateResult.annotated_features ?? 0}</span></p>
               <p>Filtered points (via search): <span className="text-slate-200 font-medium">{filteredPoints.length}</span></p>
               <p>Unique color groups: <span className="text-slate-200 font-medium">{Object.keys(groups).length}</span></p>
             </div>
@@ -1843,7 +2034,7 @@ export default function MapPage({
                 Calculating Carbon Oxidation State...
               </p>
               <p className="text-[10px] text-slate-500 max-w-[200px]">
-                Computing COS values for the top 1000 highest abundance features matching SIRIUS annotations.
+                Computing COS values for the 1000 most abundant features that have a molecular formula.
               </p>
             </div>
           ) : !carbonOxStateResult ? (
@@ -1859,7 +2050,8 @@ export default function MapPage({
               </div>
             </div>
           ) : filteredPoints.length > 0 ? (
-            <Plot
+            <CachedPlot
+              deps={[carbonOxStateResult, carbonOxStateSelectedCategories, carbonOxStateFilterBy, carbonOxStateSearchDeferred, carbonOxStateColorBy, carbonOxStateDatasetSafe]}
               data={plotlyData}
               layout={{
                 autosize: true,
@@ -1867,7 +2059,7 @@ export default function MapPage({
                 plot_bgcolor: 'white',
                 font: { color: '#334155', size: 10 },
                 title: {
-                  text: `CARBON OXIDATION STATE (${carbonOxStateDatasetSafe.replace('_', ' ')})`,
+                  text: `CARBON OXIDATION STATE (${carbonOxStateDatasetSafe.replaceAll('_', ' ')})`,
                   font: { color: '#0f172a', size: 12, weight: 'bold' }
                 },
                 xaxis: {
@@ -1919,7 +2111,8 @@ export default function MapPage({
     return (
       <div className="relative grid grid-cols-12 gap-4">
         <div className="col-span-12 bg-white border border-slate-200 rounded-lg flex flex-col items-center p-2">
-          <Plot
+          <CachedPlot
+            deps={[pcoaResult]}
             data={pcoaResult.scatter_plot.data}
             layout={{
               ...pcoaResult.scatter_plot.layout,
@@ -1962,7 +2155,8 @@ export default function MapPage({
 
     return (
       <div className="bg-white border border-slate-200 rounded-lg p-3 flex flex-col items-center">
-        <Plot
+        <CachedPlot
+          deps={[pcoaResult]}
           data={pcoaResult.variance_plot.data}
           layout={{
             ...pcoaResult.variance_plot.layout,
@@ -2083,27 +2277,6 @@ export default function MapPage({
     )
   }
 
-  const selectedFeatureSamples = useMemo(() => {
-    if (!selectedFeature?.present_samples?.length) return []
-    const uniq = new globalThis.Map()
-
-    for (const sample of selectedFeature.present_samples) {
-      const datasetSafe = String(sample.dataset_safe ?? '').trim()
-      const sampleId = String(sample.sample_id ?? '').trim()
-      if (!datasetSafe || !sampleId) continue
-      const key = `${datasetSafe}::${sampleId}`
-      if (!uniq.has(key)) {
-        uniq.set(key, {
-          dataset: String(sample.dataset ?? 'N/A'),
-          dataset_safe: datasetSafe,
-          sample_id: sampleId,
-        })
-      }
-    }
-
-    return [...uniq.values()].sort((a, b) => a.sample_id.localeCompare(b.sample_id))
-  }, [selectedFeature])
-
   const focusSampleFromFeatureList = useCallback((sample) => {
     const datasetSafe = String(sample?.dataset_safe ?? '').trim()
     const sampleId = String(sample?.sample_id ?? '').trim()
@@ -2140,7 +2313,7 @@ export default function MapPage({
         style={{ width: '100%', height: '100%' }}
         onAfterRender={onAfterRender}
       >
-        <MapLibreMap mapStyle={MAP_STYLE} />
+        {mapStyle && <MapLibreMap mapStyle={mapStyle} />}
       </DeckGL>
 
       {/* Loading overlay */}
@@ -2210,9 +2383,9 @@ export default function MapPage({
       </div>
 
       {mapFeature && metaboliteSampleKeys.size > 0 && (() => {
-        const totalSamples = mapFeature.present_samples?.length ?? metaboliteSampleKeys.size
+        const totalSamples = metaboliteSampleKeys.size
         const visibleCount = points.length
-        const filterDescription = describeActiveSampleFilters(filters, selectedSamples, sampleSearch)
+        const filterDescription = describeActiveSampleFilters(filters, selectedSamples)
         return (
           <div className="absolute top-14 right-3 z-10 bg-ocean-900/80 border border-ocean-700 rounded-lg px-3 py-2 text-[11px] text-ocean-100 max-w-md">
             <p>
@@ -2549,12 +2722,8 @@ export default function MapPage({
                 renderMetaboliteBoxplots()
               ) : globalAnalysisOption === 'Van Krevelen' ? (
                 renderVanKrevelen()
-              ) : globalAnalysisOption === 'Carbon Ox State' ? (
-                renderCarbonOxState()
               ) : (
-                <div className="rounded bg-yellow-900/20 border border-yellow-700/40 px-2 py-1.5 text-[10px] text-yellow-300">
-                  <strong>{globalAnalysisOption}</strong> dashboard view is ready. Plot rendering can be connected next.
-                </div>
+                renderCarbonOxState()
               )}
             </div>
           )}
@@ -2706,7 +2875,7 @@ export default function MapPage({
                   
                   {isSelected && (
                     <div className="mt-2 pl-2 border-l-2 border-ocean-600 space-y-1">
-                      <p className="text-[10px] font-semibold text-slate-300">Samples containing this metabolite:</p>
+                      <p className="text-[10px] font-semibold text-slate-300">Samples where this metabolite is detected:</p>
                       <div className="max-h-36 overflow-y-auto space-y-0.5 border border-slate-800/60 rounded px-1.5 py-1 bg-slate-900/40">
                         {(feature.present_samples ?? []).map((s) => (
                           <div
@@ -3102,6 +3271,24 @@ export default function MapPage({
             </button>
           </div>
 
+          {colocatedPoints.length > 1 && (
+            <div className="mb-2 flex items-center gap-2">
+              <label className="text-[10px] text-slate-400 shrink-0">
+                {colocatedPoints.length} samples at this location:
+              </label>
+              <select
+                value={getPointSampleKey(hoverPoint, mapData?.dataset_safe_map) ?? ''}
+                onChange={(e) => selectColocatedSample(e.target.value)}
+                className="min-w-0 flex-1 rounded bg-slate-800 border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-200 font-mono focus:outline-none focus:border-ocean-500"
+              >
+                {colocatedPoints.map((p) => {
+                  const key = getPointSampleKey(p, mapData?.dataset_safe_map)
+                  return <option key={key} value={key}>{resolveSampleId(p)}</option>
+                })}
+              </select>
+            </div>
+          )}
+
           {hoverTab === 'metadata' && (
             <div className="space-y-1">
               <div className="pb-1.5 mb-1.5 border-b border-slate-800">
@@ -3156,6 +3343,7 @@ export default function MapPage({
                       onChange={(e) => {
                         const val = e.target.value
                         setMetaboliteSearch(val)
+                        setHoverFeatureLimit(HOVER_FEATURE_PAGE)
                         if (metaboliteSearchTimerRef.current) clearTimeout(metaboliteSearchTimerRef.current)
                         metaboliteSearchTimerRef.current = setTimeout(() => setMetaboliteSearchDebounced(val), 120)
                       }}
@@ -3173,7 +3361,7 @@ export default function MapPage({
                     <div className={`overflow-y-auto space-y-0.5 ${hoverExpanded ? 'max-h-[52vh]' : 'max-h-44'}`}>
                       {filtered.length === 0 ? (
                         <p className="text-[10px] text-slate-400 py-1">No features match your search.</p>
-                      ) : filtered.map((m, idx) => (
+                      ) : filtered.slice(0, hoverFeatureLimit).map((m, idx) => (
                         <div key={`${m.metabolite ?? 'met'}-${idx}`} className="grid grid-cols-[1fr_auto] gap-2 py-0.5 border-b border-slate-800">
                           <span className="text-[10px] text-slate-200 break-all leading-tight">
                             {m.annotation
@@ -3186,6 +3374,15 @@ export default function MapPage({
                           </span>
                         </div>
                       ))}
+                      {filtered.length > hoverFeatureLimit && (
+                        <button
+                          type="button"
+                          onClick={() => setHoverFeatureLimit((n) => n + HOVER_FEATURE_PAGE)}
+                          className="w-full py-1 text-[10px] text-ocean-300 hover:text-ocean-200"
+                        >
+                          Show {Math.min(HOVER_FEATURE_PAGE, filtered.length - hoverFeatureLimit)} more ({(filtered.length - hoverFeatureLimit).toLocaleString()} not shown)
+                        </button>
+                      )}
                     </div>
                   </>
                 )
