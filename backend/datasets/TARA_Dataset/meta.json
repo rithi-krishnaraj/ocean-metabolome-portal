@@ -5,9 +5,11 @@
   "has_coords": true,
   "lat_col": "ATTRIBUTE_latitude",
   "lon_col": "ATTRIBUTE_longitude",
-  "n_samples": 4466,
-  "n_features": 4003,
-  "has_annotation": false,
+  "n_samples": 3319,
+  "n_features": 4266,
+  "n_samples_on_map": 3312,
+  "n_features_on_map": 4261,
+  "has_annotation": true,
   "md_columns": [
     "ATTRIBUTE_source_dataset",
     "ATTRIBUTE_sample_id",
@@ -92,8 +94,8 @@
     "ATTRIBUTE_coord_correction_note",
     "ATTRIBUTE_depth_reported",
     "ATTRIBUTE_region_label_agrees",
-    "ATTRIBUTE_date_qc_flag",
-    "feature_column"
+    "ATTRIBUTE_date_qc_flag"
   ],
-  "n_md_columns_total": 85
+  "n_md_columns_total": 84,
+  "hidden": true
 }

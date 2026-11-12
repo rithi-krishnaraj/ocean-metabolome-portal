@@ -11,6 +11,9 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.csv as pa_csv
+from pandas._libs.parsers import STR_NA_VALUES
 
 # ---------------------------------------------------------------------------
 # Coordinate column aliases (checked in order, first match wins)
@@ -72,17 +75,42 @@ def _find_coord_column(columns: list[str], aliases: list[str], kind: str) -> Opt
 # File parsing
 # ---------------------------------------------------------------------------
 
+# Large blocks parse wide feature tables (thousands of sample columns) faster
+# than pyarrow's 1 MB default.
+CSV_BLOCK_SIZE = 64 << 20
+
+
+def read_delimited(source, sep: str) -> pd.DataFrame:
+    """Parse a delimited file with pyarrow's multithreaded CSV reader.
+
+    Gives the same frame as pd.read_csv(engine="pyarrow") (pandas' NA strings,
+    all-empty columns as float NaN) but skips pandas' post-processing, which
+    costs ~2 s on a 2,000-sample feature table. Raises ValueError
+    (pyarrow.ArrowInvalid) on malformed rows.
+    """
+    table = pa_csv.read_csv(
+        source,
+        read_options=pa_csv.ReadOptions(block_size=CSV_BLOCK_SIZE),
+        parse_options=pa_csv.ParseOptions(delimiter=sep),
+        convert_options=pa_csv.ConvertOptions(null_values=sorted(STR_NA_VALUES), strings_can_be_null=True),
+    )
+    schema = pa.schema([f.with_type(pa.float64()) if pa.types.is_null(f.type) else f for f in table.schema])
+    return table.cast(schema).to_pandas()
+
+
 def parse_file(content: bytes, filename: str) -> Optional[pd.DataFrame]:
     """Parse uploaded file bytes into a DataFrame."""
     ext = filename.rsplit(".", 1)[-1].lower()
     try:
         if ext == "xlsx":
             df = pd.read_excel(io.BytesIO(content))
+        elif ext == "parquet":
+            # Keeps a stored index (e.g. 'filename' / 'metabolite' from the portal's own exports)
+            df = pd.read_parquet(io.BytesIO(content))
         else:
             sep = "\t" if ext in ("tsv", "txt") else ","
             try:
-                # pyarrow's multithreaded parser is ~3× faster on large feature tables
-                df = pd.read_csv(io.BytesIO(content), sep=sep, engine="pyarrow")
+                df = read_delimited(io.BytesIO(content), sep)
             except ValueError:  # malformed rows: fall back to the tolerant C parser
                 df = pd.read_csv(io.BytesIO(content), sep=sep, on_bad_lines="skip")
 
@@ -114,17 +142,27 @@ def _mz_rt_columns(ft: pd.DataFrame) -> tuple[Optional[str], Optional[str]]:
     return first_match(_MZ_PATTERNS), first_match(_RT_PATTERNS)
 
 
+# Lower-case column names (underscores read as spaces) that name each feature.
+FEATURE_NAME_ALIASES = ["metabolite", "feature name", "feature", "feature id"]
+
+
 def index_feature_table(ft: pd.DataFrame) -> pd.DataFrame:
     """Give an uploaded feature table its metabolite index, as FBMN-STATS load_ft does:
 
-    1. a 'metabolite' column, if present;
+    1. a feature-name column ('metabolite', 'Feature Name', ...), if present;
     2. GNPS/MZmine 'row ID' + 'row m/z' + 'row retention time' → rowID_mz_rt
        (the same IDs a GNPS task load produces);
     3. otherwise the first m/z-like and RT-like columns → [rowID_]mz@rt.
     Must run before clean_feature_table(), which drops those columns.
     """
-    if "metabolite" in ft.columns:
-        ft.index = ft["metabolite"].astype(str)
+    if ft.index.name == "metabolite":  # already indexed, e.g. a portal parquet export
+        return ft
+    name_col = next(
+        (c for c in ft.columns if str(c).strip().lower().replace("_", " ") in FEATURE_NAME_ALIASES),
+        None,
+    )
+    if name_col is not None:
+        ft.index = ft[name_col].astype(str)
         ft.index.name = "metabolite"
         return ft
     if {"row ID", "row m/z", "row retention time"} <= set(ft.columns):
@@ -198,14 +236,16 @@ def add_metabolite_index(ft: pd.DataFrame) -> pd.DataFrame:
 
 def clean_feature_table(ft: pd.DataFrame) -> pd.DataFrame:
     """Remove non-sample columns and normalise column names."""
-    # Drop only completely empty rows/columns; a sample with a few empty cells must not be lost.
-    ft = ft.copy().dropna(how="all").dropna(axis=1, how="all")
-
     sample_cols = [c for c in ft.columns if ".mzML" in str(c) or ".mzXML" in str(c)]
+    if sample_cols:
+        # Select samples first: dropna below then scans only these columns.
+        ft = ft[sample_cols]
+
+    # Drop only completely empty rows/columns; a sample with a few empty cells must not be lost.
+    ft = _drop_empty(ft, columns=True)
 
     if sample_cols:
-        ft = ft[sample_cols]
-        ft.rename(
+        ft = ft.rename(
             columns={
                 c: re.sub(r"\s*Peak area$", "", str(c))
                     .replace(".mzXML", "")
@@ -213,7 +253,7 @@ def clean_feature_table(ft: pd.DataFrame) -> pd.DataFrame:
                     .strip()
                 for c in ft.columns
             },
-            inplace=True,
+            copy=False,
         )
     else:
         # No standard extensions: treat numeric columns as samples, except the
@@ -226,7 +266,18 @@ def clean_feature_table(ft: pd.DataFrame) -> pd.DataFrame:
         if numeric_cols:
             ft = ft[numeric_cols]
 
-    return ft.dropna(how="all")
+    return _drop_empty(ft)
+
+
+def _drop_empty(df: pd.DataFrame, columns: bool = False) -> pd.DataFrame:
+    """Drop all-NaN rows (and columns), like dropna(how="all"), but return df itself
+    when nothing is empty: dropna copies the whole table, ~0.3 s for a large feature table."""
+    present = df.notna().to_numpy()
+    rows = present.any(axis=1)
+    cols = present.any(axis=0) if columns else np.ones(df.shape[1], dtype=bool)
+    if rows.all() and cols.all():
+        return df
+    return df.iloc[rows, cols]
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +295,26 @@ def clean_metadata_table(md: pd.DataFrame) -> pd.DataFrame:
         if md[col].dtype == object:
             md[col] = md[col].astype(str).str.strip()
     return md
+
+
+def drop_unknown_ecosystem(
+    md: pd.DataFrame, ft: Optional[pd.DataFrame] = None
+) -> tuple[pd.DataFrame, Optional[pd.DataFrame], int]:
+    """Remove samples whose ATTRIBUTE_Ecosystem (any case) is Unknown, e.g.
+    'Unknown (no coordinates or metadata)', from the metadata and the feature table.
+
+    Returns (md, ft, number of samples removed).
+    """
+    col = next((c for c in md.columns if str(c).lower() == "attribute_ecosystem"), None)
+    if col is None:
+        return md, ft, 0
+    unknown = md[col].astype(str).str.strip().str.lower().str.startswith("unknown")
+    if not unknown.any():
+        return md, ft, 0
+    removed = md.index[unknown]
+    if ft is not None and not ft.empty:
+        ft = ft.drop(columns=[c for c in ft.columns if c in set(removed)]).dropna(how="all")
+    return md.loc[~unknown], ft, int(unknown.sum())
 
 
 # ---------------------------------------------------------------------------

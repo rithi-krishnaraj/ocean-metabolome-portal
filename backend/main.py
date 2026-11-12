@@ -10,8 +10,12 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 import uuid
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 import skbio
@@ -19,27 +23,36 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from scipy import sparse
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from data_processor import (
     clean_feature_table,
+    index_feature_table,
     clean_metadata_table,
+    drop_unknown_ecosystem,
     create_combined_table,
     parse_file,
     validate_coordinates,
 )
-from gnps_client import GNPS2_WORKFLOW_KEYS, detect_workflow, load_eb, load_fbmn
+from gnps_client import GNPS2_WORKFLOW_KEYS, detect_workflow, load_eb, load_fbmn, normalize_eb_annotations
 
 # Optional RDKit — enables SMILES → molecular formula fallback for Van Krevelen plots
 try:
     from rdkit import Chem as _rd_Chem
     from rdkit.Chem import rdMolDescriptors as _rd_md
+    from rdkit import RDLogger as _rd_logger
+
+    # Unparseable SMILES just yield no formula; RDKit's per-molecule error logging floods the console
+    _rd_logger.DisableLog("rdApp.*")
     _RDKIT_AVAILABLE = True
 except ImportError:
     _RDKIT_AVAILABLE = False
@@ -57,6 +70,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Dashboard responses (sample metadata, plots) are several MB of repetitive JSON
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 DATASETS_DIR = Path(__file__).parent / "datasets"
 DATASETS_DIR.mkdir(exist_ok=True)
@@ -66,7 +81,22 @@ sessions: dict = {}
 
 # In-memory caches for blazingly fast performance
 DATASET_DF_CACHE = {}  # dataset_safe -> {"md": DataFrame, "ft": DataFrame, "mtime_md": float, "mtime_ft": float}
-PCOA_CACHE = {}        # (dataset_safe, distance_metric, sample_cols_tuple) -> {"evals": ndarray, "evecs": ndarray, "proportion_explained": list}
+PCOA_CACHE = OrderedDict()       # (dataset_safe, file mtimes, distance_metric, sorted sample ids) -> skbio OrdinationResults
+PERMANOVA_CACHE = OrderedDict()  # PCOA_CACHE key + (color_by,) -> PERMANOVA result records
+PCOA_CACHE_MAX = 16
+FEATURE_FILTER_CACHE = {}  # dataset dir name -> {"key": file mtimes, "index": _feature_filter_index() result}
+AN_CACHE = {}  # dataset_safe -> {"an": DataFrame, "mtime": float}
+# Statistics dashboard results (mostly pre-encoded JSON), keyed by _stats_key(): any change to
+# the dataset's files or public columns gives a new key, so stale entries are never served.
+STATS_CACHE = OrderedDict()
+STATS_CACHE_MAX = 64
+# Whole-dataset sample × sample distance matrices: (dataset_safe, ft mtime, metric) -> (sample ids, matrix).
+# Also saved to <dataset>/.cache/ so they survive restarts.
+DIST_CACHE = OrderedDict()
+DIST_CACHE_MAX = 4
+DIST_CACHE_DIRNAME = ".cache"
+_cache_lock = threading.Lock()
+_dist_locks: dict = {}  # DIST_CACHE key -> Lock, so concurrent requests compute a matrix only once
 
 # ---------------------------------------------------------------------------
 # Admin authentication
@@ -117,7 +147,8 @@ def parse_feature_labels(columns):
     return mz_values, rt_values
 
 
-def get_cached_dataset(dataset_safe: str, dataset_dir: Path):
+def _dataset_frames(dataset_safe: str, dataset_dir: Path):
+    """Cached (md, ft) exactly as saved — all metadata columns, no copy. Callers must not modify them."""
     md_path = dataset_dir / "md.parquet"
     ft_path = dataset_dir / "ft.parquet"
 
@@ -127,22 +158,85 @@ def get_cached_dataset(dataset_safe: str, dataset_dir: Path):
     mtime_md = md_path.stat().st_mtime
     mtime_ft = ft_path.stat().st_mtime
 
-    # Public columns are applied on every call (not cached), so editing them takes effect at once.
-    meta = _read_meta(dataset_dir)
-
     cached = DATASET_DF_CACHE.get(dataset_safe)
-    if cached and cached["mtime_md"] == mtime_md and cached["mtime_ft"] == mtime_ft:
-        return _public_md(cached["md"], meta).copy(), cached["ft"].copy()
+    if not (cached and cached["mtime_md"] == mtime_md and cached["mtime_ft"] == mtime_ft):
+        cached = {
+            "md": pd.read_parquet(md_path),
+            "ft": pd.read_parquet(ft_path),
+            "mtime_md": mtime_md,
+            "mtime_ft": mtime_ft
+        }
+        DATASET_DF_CACHE[dataset_safe] = cached
+    return cached["md"], cached["ft"]
 
-    md = pd.read_parquet(md_path)
-    ft = pd.read_parquet(ft_path)
-    DATASET_DF_CACHE[dataset_safe] = {
-        "md": md,
-        "ft": ft,
-        "mtime_md": mtime_md,
-        "mtime_ft": mtime_ft
-    }
-    return _public_md(md, meta).copy(), ft.copy()
+
+def get_cached_dataset(dataset_safe: str, dataset_dir: Path):
+    md, ft = _dataset_frames(dataset_safe, dataset_dir)
+    if md is None:
+        return None, None
+    # Public columns are applied on every call (not cached), so editing them takes effect at once.
+    return _public_md(md, _read_meta(dataset_dir)).copy(), ft.copy()
+
+
+def _annotation_frame(dataset_safe: str, dataset_dir: Path) -> Optional[pd.DataFrame]:
+    """Cached annotation table (no copy; callers must not modify it), or None when there is none."""
+    an_path = dataset_dir / "an.parquet"
+    if not an_path.exists():
+        return None
+    mtime = an_path.stat().st_mtime
+    cached = AN_CACHE.get(dataset_safe)
+    if not (cached and cached["mtime"] == mtime):
+        cached = {"an": pd.read_parquet(an_path), "mtime": mtime}
+        AN_CACHE[dataset_safe] = cached
+    return cached["an"]
+
+
+def _stats_key(kind: str, dataset_dir: Path, *args) -> tuple:
+    """Cache key that changes whenever any of the dataset's files (or its public columns) change."""
+    mtimes = tuple(
+        p.stat().st_mtime if p.exists() else 0.0
+        for p in (dataset_dir / f for f in ("md.parquet", "ft.parquet", "an.parquet", "meta.json"))
+    )
+    return (kind, dataset_dir.name, mtimes, *args)
+
+
+def _lru_get(cache: OrderedDict, key):
+    with _cache_lock:
+        if key not in cache:
+            return None
+        cache.move_to_end(key)
+        return cache[key]
+
+
+def _lru_put(cache: OrderedDict, key, value, max_size: int) -> None:
+    with _cache_lock:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
+
+
+def _cached_stats(key: tuple, compute):
+    value = _lru_get(STATS_CACHE, key)
+    if value is None:
+        value = compute()
+        _lru_put(STATS_CACHE, key, value, STATS_CACHE_MAX)
+    return value
+
+
+def _json_response(body: str) -> Response:
+    return Response(body, media_type="application/json")
+
+
+def _invalidate_dataset_caches(dataset_safe: str) -> None:
+    DATASET_DF_CACHE.pop(dataset_safe, None)
+    AN_CACHE.pop(dataset_safe, None)
+    with _cache_lock:
+        for cache in (PCOA_CACHE, PERMANOVA_CACHE, DIST_CACHE):
+            for k in [k for k in cache if k[0] == dataset_safe]:
+                cache.pop(k, None)
+        for k in [k for k in STATS_CACHE if k[1] == dataset_safe]:
+            STATS_CACHE.pop(k, None)
 
 
 def _dataset_mtimes(dataset_dir: Path) -> tuple[float, float]:
@@ -157,8 +251,19 @@ def _dataset_mtimes(dataset_dir: Path) -> tuple[float, float]:
 
 PREVIEW_MAX_ROWS = 200
 # Feature and combined tables have one column per sample or feature (thousands); previews
-# keep the first columns so the response and the admin table stay small.
+# of every table keep the first columns so the response and the admin table stay small.
 PREVIEW_MAX_COLS = 50
+
+
+def _df_records_json(
+    df: Optional[pd.DataFrame],
+    max_rows: int = PREVIEW_MAX_ROWS,
+    max_cols: Optional[int] = PREVIEW_MAX_COLS,
+) -> str:
+    """The first rows/columns of df as a JSON array of records (NaN → null)."""
+    if df is None or df.empty:
+        return "[]"
+    return df.iloc[:max_rows, :max_cols].reset_index().to_json(orient="records", default_handler=str)
 
 
 def _df_records(
@@ -166,17 +271,47 @@ def _df_records(
     max_rows: int = PREVIEW_MAX_ROWS,
     max_cols: Optional[int] = PREVIEW_MAX_COLS,
 ) -> list:
-    if df is None or df.empty:
-        return []
-    df = df.iloc[:max_rows, :max_cols].reset_index()
-    # Replace NaN with None for JSON serialisation
-    return json.loads(df.to_json(orient="records", default_handler=str))
+    return json.loads(_df_records_json(df, max_rows, max_cols))
+
+
+def _upload_response(fields: dict, ft: pd.DataFrame, md: pd.DataFrame, an: Optional[pd.DataFrame]) -> Response:
+    """Upload result with table previews, sent as pre-encoded JSON.
+
+    A feature table preview has hundreds of thousands of cells; returning it as Python
+    objects made FastAPI re-encode every value (~3 s for a 2,400-sample GNPS task).
+    """
+    named_ft = _named_features(ft)
+    # The combined preview needs only the first samples and columns, not the full
+    # samples × features table (save_dataset builds that).
+    ft_samples = set(ft.columns)
+    preview_samples = [s for s in md.index if s in ft_samples][:PREVIEW_MAX_ROWS]
+    combined = create_combined_table(ft[preview_samples].iloc[:PREVIEW_MAX_COLS], md)
+    fields = {
+        **fields,
+        "ft_columns": _df_columns(named_ft),
+        "md_columns": _df_columns(md),
+        "preview_max_rows": PREVIEW_MAX_ROWS,
+        "preview_max_cols": PREVIEW_MAX_COLS,
+    }
+    previews = {
+        "ft_preview": _df_records_json(named_ft),
+        "md_preview": _df_records_json(md),
+        "an_preview": _df_records_json(an),
+        "combined_preview": _df_records_json(combined),
+    }
+    body = json.dumps(fields, default=str)[:-1] + "".join(f", {json.dumps(k)}: {v}" for k, v in previews.items()) + "}"
+    return Response(body, media_type="application/json")
 
 
 def _df_columns(df: Optional[pd.DataFrame]) -> list:
     if df is None or df.empty:
         return []
     return list(df.reset_index().columns)
+
+
+def _named_features(ft: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Label the feature index 'Feature Name' so previews show it as the first column."""
+    return None if ft is None else ft.rename_axis("Feature Name")
 
 
 def _safe_name(name: str) -> str:
@@ -218,6 +353,27 @@ def _public_md(md: pd.DataFrame, meta: dict) -> pd.DataFrame:
     keep = {str(c) for c in public}
     coords = {str(meta.get(k) or "").strip().lower() for k in ("lat_col", "lon_col")}
     return md[[c for c in md.columns if str(c) in keep or str(c).strip().lower() in coords]]
+
+
+def _map_coverage(ft: pd.DataFrame, md: pd.DataFrame, lat_col: Optional[str], lon_col: Optional[str]) -> tuple[int, int]:
+    """(samples, features) that appear on the map.
+
+    A sample is mapped when its Latitude and Longitude are both numeric; a feature
+    counts when it has a positive intensity in at least one mapped sample.
+    """
+    if md is None or md.empty:
+        return 0, 0
+    lat_col = _find_column_case_insensitive(md, lat_col)
+    lon_col = _find_column_case_insensitive(md, lon_col)
+    if not lat_col or not lon_col:
+        return 0, 0
+    has_coords = pd.to_numeric(md[lat_col], errors="coerce").notna() & pd.to_numeric(md[lon_col], errors="coerce").notna()
+    mapped_samples = set(md.index[has_coords].astype(str))
+    sample_cols = [c for c in ft.columns if str(c) in mapped_samples]
+    if not sample_cols:
+        return len(mapped_samples), 0
+    intensities = ft[sample_cols].apply(pd.to_numeric, errors="coerce")
+    return len(mapped_samples), int((intensities > 0).any(axis=1).sum())
 
 
 def _read_meta(dataset_dir: Path) -> dict:
@@ -279,7 +435,8 @@ def _resolve_ft_sample_column(ft: pd.DataFrame, candidates: list[str]) -> Option
 
 
 def _parse_feature_parts(feature_key: str) -> tuple[str, Optional[float], Optional[float]]:
-    key = str(feature_key).strip()
+    # Ignore an appended compound name ("rowID_mz_rt&Compound_Name"), as in datasets saved with one
+    key = str(feature_key).split("&", 1)[0].strip()
     parts = key.split("_")
     row_id = parts[0] if parts else key
     mz = None
@@ -366,46 +523,45 @@ async def upload_manual(
     if "filename" in md.columns:
         md = md.set_index("filename")
 
-    ft = clean_feature_table(ft)
-    md = clean_metadata_table(md)
-
     an: Optional[pd.DataFrame] = None
     if an_file and an_file.filename:
         an = parse_file(await an_file.read(), an_file.filename)
+        if an is not None:
+            # Everything Bagel library matches name their columns differently (query_scan, NAME, ...)
+            an = normalize_eb_annotations(an)
+
+    # Index by feature name first: cleaning drops the name / ID / m/z / RT columns.
+    ft = clean_feature_table(index_feature_table(ft))
+    md = clean_metadata_table(md)
+    md, ft, n_unknown_ecosystem = drop_unknown_ecosystem(md, ft)
 
     has_coords, lat_col, lon_col = validate_coordinates(md)
-    combined = create_combined_table(ft, md)
 
     session_id = str(uuid.uuid4())
     sessions[session_id] = dict(
         ft=ft,
         md=md,
         an=an,
-        combined=combined,
         has_coords=has_coords,
         lat_col=lat_col,
         lon_col=lon_col,
         source_task_id=None,
     )
 
-    return {
-        "session_id": session_id,
-        "default_name": "",
-        "has_coords": has_coords,
-        "lat_col": lat_col,
-        "lon_col": lon_col,
-        "ft_shape": list(ft.shape),
-        "md_shape": list(md.shape),
-        "an_shape": list(an.shape) if an is not None else [0, 0],
-        "ft_columns": _df_columns(ft),
-        "md_columns": _df_columns(md),
-        "ft_preview": _df_records(ft),
-        "md_preview": _df_records(md, max_cols=None),
-        "an_preview": _df_records(an),
-        "combined_preview": _df_records(combined),
-        "preview_max_rows": PREVIEW_MAX_ROWS,
-        "preview_max_cols": PREVIEW_MAX_COLS,
-    }
+    return _upload_response(
+        {
+            "session_id": session_id,
+            "default_name": "",
+            "has_coords": has_coords,
+            "lat_col": lat_col,
+            "lon_col": lon_col,
+            "ft_shape": list(ft.shape),
+            "md_shape": list(md.shape),
+            "n_unknown_ecosystem_removed": n_unknown_ecosystem,
+            "an_shape": list(an.shape) if an is not None else [0, 0],
+        },
+        ft, md, an,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -456,41 +612,36 @@ async def upload_gnps(body: dict):
 
     ft = clean_feature_table(ft)
     md = clean_metadata_table(md) if md is not None and not md.empty else pd.DataFrame()
+    md, ft, n_unknown_ecosystem = drop_unknown_ecosystem(md, ft)
 
     has_coords, lat_col, lon_col = validate_coordinates(md)
-    combined = create_combined_table(ft, md)
 
     session_id = str(uuid.uuid4())
     sessions[session_id] = dict(
         ft=ft,
         md=md,
         an=an,
-        combined=combined,
         has_coords=has_coords,
         lat_col=lat_col,
         lon_col=lon_col,
         source_task_id=task_id,
     )
 
-    return {
-        "session_id": session_id,
-        "default_name": task_id,
-        "source_task_id": task_id,
-        "has_coords": has_coords,
-        "lat_col": lat_col,
-        "lon_col": lon_col,
-        "ft_shape": list(ft.shape),
-        "md_shape": list(md.shape) if md is not None else [0, 0],
-        "an_shape": list(an.shape) if an is not None else [0, 0],
-        "ft_columns": _df_columns(ft),
-        "md_columns": _df_columns(md),
-        "ft_preview": _df_records(ft),
-        "md_preview": _df_records(md, max_cols=None),
-        "an_preview": _df_records(an),
-        "combined_preview": _df_records(combined),
-        "preview_max_rows": PREVIEW_MAX_ROWS,
-        "preview_max_cols": PREVIEW_MAX_COLS,
-    }
+    return _upload_response(
+        {
+            "session_id": session_id,
+            "default_name": task_id,
+            "source_task_id": task_id,
+            "has_coords": has_coords,
+            "lat_col": lat_col,
+            "lon_col": lon_col,
+            "ft_shape": list(ft.shape),
+            "md_shape": list(md.shape) if md is not None else [0, 0],
+            "n_unknown_ecosystem_removed": n_unknown_ecosystem,
+            "an_shape": list(an.shape) if an is not None else [0, 0],
+        },
+        ft, md, an,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +683,7 @@ async def save_dataset(body: dict):
     an: Optional[pd.DataFrame] = sess.get("an")
 
     combined = create_combined_table(ft, md)
+    n_samples_on_map, n_features_on_map = _map_coverage(ft, md, sess["lat_col"], sess["lon_col"])
 
     # Save as parquet (fast, compact)
     ft.to_parquet(dataset_dir / "ft.parquet")
@@ -551,6 +703,9 @@ async def save_dataset(body: dict):
         "lon_col": sess["lon_col"],
         "n_samples": int(md.shape[0]),
         "n_features": int(ft.shape[0]),
+        # Only samples with coordinates (and features detected in them) are shown on the map
+        "n_samples_on_map": n_samples_on_map,
+        "n_features_on_map": n_features_on_map,
         "has_annotation": an is not None and not an.empty,
         # Public metadata columns (the admin's choice; all columns if none was sent)
         "md_columns": _validated_md_columns(body.get("visible_md_columns"), md),
@@ -558,14 +713,20 @@ async def save_dataset(body: dict):
     }
     (dataset_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    # Invalidate caches
-    DATASET_DF_CACHE.pop(safe, None)
-    keys_to_del = [k for k in PCOA_CACHE if k[0] == safe]
-    for k in keys_to_del:
-        PCOA_CACHE.pop(k, None)
+    # Invalidate caches, then precompute the statistics dashboard's defaults in the background
+    _invalidate_dataset_caches(safe)
+    _start_stats_warmup([safe])
 
     del sessions[session_id]
-    return {"success": True, "name": name, "safe_name": safe}
+    return {
+        "success": True,
+        "name": name,
+        "safe_name": safe,
+        "n_samples": meta["n_samples"],
+        "n_features": meta["n_features"],
+        "n_samples_on_map": n_samples_on_map,
+        "n_features_on_map": n_features_on_map,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +769,7 @@ async def get_dataset_settings(safe_name: str):
 
 @app.patch("/api/datasets/{safe_name}", dependencies=[Depends(require_admin)])
 async def update_dataset(safe_name: str, body: dict):
-    """Edit a saved dataset's display name and public metadata columns.
+    """Edit a saved dataset's display name, public metadata columns and map visibility.
 
     The folder (safe_name) stays the same, so links, caches and the files on disk are unaffected.
     """
@@ -630,9 +791,12 @@ async def update_dataset(safe_name: str, body: dict):
         meta["md_columns"] = _validated_md_columns(body.get("md_columns"), md)
         meta["n_md_columns_total"] = int(md.shape[1])
 
+    if "hidden" in body:
+        # Hidden datasets stay saved but are left out of the public map and its analyses.
+        meta["hidden"] = bool(body.get("hidden"))
+
     meta_path.write_text(json.dumps(meta, indent=2))
-    for k in [k for k in PCOA_CACHE if k[0] == safe_name]:
-        PCOA_CACHE.pop(k, None)
+    _invalidate_dataset_caches(safe_name)
     return meta
 
 
@@ -643,11 +807,7 @@ async def delete_dataset(safe_name: str):
     if dataset_dir.parent != DATASETS_DIR.resolve() or not dataset_dir.is_dir():
         raise HTTPException(404, "Dataset not found.")
     shutil.rmtree(dataset_dir)
-    # Invalidate caches
-    DATASET_DF_CACHE.pop(safe_name, None)
-    keys_to_del = [k for k in PCOA_CACHE if k[0] == safe_name]
-    for k in keys_to_del:
-        PCOA_CACHE.pop(k, None)
+    _invalidate_dataset_caches(safe_name)
     return {"success": True}
 
 
@@ -660,8 +820,9 @@ async def get_dataset_table(safe_name: str, table_name: str):
     if not path.exists():
         return {"data": [], "columns": []}
     df = pd.read_parquet(path)
-    max_cols = None if table_name == "md" else PREVIEW_MAX_COLS
-    return {"data": _df_records(df, max_cols=max_cols), "columns": _df_columns(df)}
+    if table_name == "ft":
+        df = _named_features(df)
+    return {"data": _df_records(df), "columns": _df_columns(df)}
 
 
 # ---------------------------------------------------------------------------
@@ -690,16 +851,33 @@ async def get_map_data():
             continue
 
         meta = json.loads(meta_path.read_text())
+        if meta.get("hidden"):
+            continue
         dataset_names.append(meta["name"])
         dataset_safe_map[str(meta["name"])] = str(meta.get("safe_name", d.name))
-        total_features += meta.get("n_features", 0)
+
+        if "n_features_on_map" not in meta:
+            # Datasets saved before map coverage was recorded: compute once and store it.
+            ft_path = d / "ft.parquet"
+            if meta.get("has_coords") and md_path.exists() and ft_path.exists():
+                meta["n_samples_on_map"], meta["n_features_on_map"] = _map_coverage(
+                    pd.read_parquet(ft_path), pd.read_parquet(md_path), meta.get("lat_col"), meta.get("lon_col")
+                )
+            else:
+                meta["n_samples_on_map"], meta["n_features_on_map"] = 0, 0
+            meta_path.write_text(json.dumps(meta, indent=2))
+
+        # Only features detected in samples with coordinates count towards the map total
+        total_features += meta["n_features_on_map"]
 
         # Collect detailed info for each dataset
         datasets_details.append({
             "name": meta["name"],
             "safe_name": meta.get("safe_name", d.name),
-            "n_samples": meta.get("n_samples", 0),
-            "n_features": meta.get("n_features", 0),
+            "n_samples": meta["n_samples_on_map"],
+            "n_features": meta["n_features_on_map"],
+            "n_samples_total": meta.get("n_samples", 0),
+            "n_features_total": meta.get("n_features", 0),
             "has_coords": meta.get("has_coords", False)
         })
 
@@ -773,6 +951,80 @@ async def get_map_data():
     }
 
 
+def _feature_filter_index(d: Path, meta: dict) -> Optional[dict]:
+    """Per-dataset data for metabolite filtering, cached until the dataset's files change:
+    one row per feature (parsed row ID / m/z / RT, annotation, lower-case search text) and
+    a sparse features × samples intensity matrix over the samples that have coordinates
+    (only detections are stored: feature tables are mostly zeros).
+    None when the dataset has no mappable samples.
+    """
+    paths = [d / "meta.json", d / "md.parquet", d / "ft.parquet", d / "an.parquet"]
+    key = tuple(p.stat().st_mtime if p.exists() else 0.0 for p in paths)
+    cached = FEATURE_FILTER_CACHE.get(d.name)
+    if cached and cached["key"] == key:
+        return cached["index"]
+
+    index = None
+    md = _public_md(pd.read_parquet(d / "md.parquet"), meta)
+    lat_col = _find_column_case_insensitive(md, meta.get("lat_col"))
+    lon_col = _find_column_case_insensitive(md, meta.get("lon_col"))
+    if lat_col and lon_col:
+        md.index = md.index.astype(str)
+        coords = pd.DataFrame({
+            "lat": pd.to_numeric(md[lat_col], errors="coerce"),
+            "lon": pd.to_numeric(md[lon_col], errors="coerce"),
+        }).dropna()
+        coords = coords[~coords.index.duplicated()]  # a repeated sample takes its first coordinates
+
+        ft = pd.read_parquet(d / "ft.parquet")
+        ft.columns = [str(c) for c in ft.columns]
+        ft.index = ft.index.astype(str)
+        sample_cols = [c for c in ft.columns if c in coords.index]
+        if sample_cols:
+            values = ft[sample_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+            # NaN compares False: missing or zero means not detected
+            intensities = sparse.csr_matrix(np.where(values > 0, values, 0.0))
+            del values
+
+            annotation_map: dict[str, str] = {}
+            an_path = d / "an.parquet"
+            if an_path.exists():
+                an = pd.read_parquet(an_path)
+                name_col = next((c for c in ["Compound_Name", "compound_name", "name", "Name"] if c in an.columns), None)
+                scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
+                if name_col and scan_col:
+                    annotation_map = dict(zip(an[scan_col].astype(str), an[name_col].astype(str)))
+
+            parsed = [_parse_feature_parts(k) for k in ft.index]
+            features = pd.DataFrame({
+                "metabolite": ft.index,
+                "row_id": [p[0] for p in parsed],
+                "row_mz": [p[1] for p in parsed],
+                "row_retention_time": [p[2] for p in parsed],
+            })
+            annotations = features["row_id"].map(annotation_map).fillna("").astype(str)
+            features["annotation"] = annotations.where(annotations != "nan", "")
+            features["sample_count"] = np.diff(intensities.indptr)
+            # Search text, lower-cased once: the filters below are substring matches.
+            features["q_row_id"] = features["row_id"].str.lower()
+            features["q_mz"] = ["" if p[1] is None else str(p[1]).lower() for p in parsed]
+            features["q_rt"] = ["" if p[2] is None else str(p[2]).lower() for p in parsed]
+            features["q_metabolite"] = features["metabolite"].str.lower()
+            features["q_annotation"] = features["annotation"].str.lower()
+
+            coords = coords.loc[sample_cols]
+            index = {
+                "features": features,
+                "intensities": intensities,
+                "sample_ids": sample_cols,
+                "lat": coords["lat"].astype(float).tolist(),
+                "lon": coords["lon"].astype(float).tolist(),
+            }
+
+    FEATURE_FILTER_CACHE[d.name] = {"key": key, "index": index}
+    return index
+
+
 @app.post("/api/map/metabolite-features")
 async def get_metabolite_features(body: dict):
     row_id_q = str(body.get("row_id", "")).strip().lower()
@@ -787,150 +1039,120 @@ async def get_metabolite_features(body: dict):
     dataset_safes_raw = body.get("dataset_safes") or []
     dataset_safes = {str(x).strip() for x in dataset_safes_raw if str(x).strip()}
 
+    # The map's sample filters: {dataset_safe: [sample IDs]}. When given, only these samples
+    # count, and datasets missing from it are skipped. Absent means every sample.
+    sample_keys = body.get("sample_keys")
+    if not isinstance(sample_keys, dict):
+        sample_keys = None
+
     limit = int(body.get("limit", 200))
     limit = max(1, min(limit, 1000))
 
-    features_out = []
+    def contains(col: pd.Series, q: str) -> pd.Series:
+        return col.str.contains(q, regex=False)
 
+    # (sample_count, metabolite, dataset, feature position) for every match
+    matches = []
     for d in DATASETS_DIR.iterdir():
         if not d.is_dir():
             continue
-
-        meta_path = d / "meta.json"
-        md_path = d / "md.parquet"
-        ft_path = d / "ft.parquet"
-        an_path = d / "an.parquet"
-        if not meta_path.exists() or not md_path.exists() or not ft_path.exists():
+        if not all((d / f).exists() for f in ("meta.json", "md.parquet", "ft.parquet")):
             continue
 
-        meta = json.loads(meta_path.read_text())
-        dataset_safe = str(meta.get("safe_name", d.name))
-        dataset_name = str(meta.get("name", d.name))
-        if dataset_safes and dataset_safe not in dataset_safes:
+        meta = json.loads((d / "meta.json").read_text())
+        if meta.get("hidden"):
+            continue
+        dataset = {
+            "safe": str(meta.get("safe_name", d.name)),
+            "name": str(meta.get("name", d.name)),
+        }
+        if dataset_safes and dataset["safe"] not in dataset_safes:
+            continue
+        if sample_keys is not None and not sample_keys.get(dataset["safe"]):
             continue
 
-        md = _public_md(pd.read_parquet(md_path), meta)
-        lat_col = _find_column_case_insensitive(md, meta.get("lat_col"))
-        lon_col = _find_column_case_insensitive(md, meta.get("lon_col"))
-        if not lat_col or not lon_col:
+        index = await asyncio.to_thread(_feature_filter_index, d, meta)
+        if index is None:
             continue
+        dataset["index"] = index
 
-        md.index = md.index.astype(str)
-        md["_lat"] = pd.to_numeric(md[lat_col], errors="coerce")
-        md["_lon"] = pd.to_numeric(md[lon_col], errors="coerce")
-
-        md_reset = md.reset_index()
-        fallback_ids = [f"row_{i}" for i in range(len(md_reset))]
-        if "filename" in md_reset.columns:
-            candidate_ids = md_reset["filename"].astype(str)
-            md["_sample_id"] = np.where(candidate_ids.str.strip().ne(""), candidate_ids, fallback_ids)
-        else:
-            index_ids = md.index.astype(str)
-            md["_sample_id"] = np.where(pd.Series(index_ids).str.strip().ne(""), index_ids, fallback_ids)
-
-        md_valid = md.dropna(subset=["_lat", "_lon"])
-        if md_valid.empty:
-            continue
-
-        valid_sample_ids = set(md_valid.index.astype(str))
-
-        ft = pd.read_parquet(ft_path)
-        ft.columns = [str(c) for c in ft.columns]
-        ft.index = ft.index.astype(str)
-
-        sample_cols = [c for c in ft.columns if c in valid_sample_ids]
-        if not sample_cols:
-            continue
-
-        annotation_map: dict[str, str] = {}
-        if an_path.exists():
-            an = pd.read_parquet(an_path)
-            if not an.empty:
-                name_col = next(
-                    (c for c in ["Compound_Name", "compound_name", "name", "Name"] if c in an.columns),
-                    None,
-                )
-                scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
-                if name_col and scan_col:
-                    an_copy = an[[scan_col, name_col]].copy()
-                    an_copy[scan_col] = an_copy[scan_col].astype(str)
-                    an_copy[name_col] = an_copy[name_col].astype(str)
-                    annotation_map = dict(zip(an_copy[scan_col], an_copy[name_col]))
-
-        for feature_key, row in ft[sample_cols].iterrows():
-            feature_str = str(feature_key)
-            parsed_row_id, parsed_mz, parsed_rt = _parse_feature_parts(feature_str)
-            annotation_name = str(annotation_map.get(parsed_row_id, ""))
-            if annotation_name == "nan":
-                annotation_name = ""
-
-            if row_id_q and row_id_q not in parsed_row_id.lower():
+        f = index["features"]
+        counts = f["sample_count"].to_numpy()
+        allowed = None  # mask over index["sample_ids"]; None = all samples
+        if sample_keys is not None:
+            wanted = {str(x) for x in sample_keys[dataset["safe"]]}
+            allowed = np.array([sid in wanted for sid in index["sample_ids"]])
+            if not allowed.any():
                 continue
-            if mz_q and mz_q not in ("" if parsed_mz is None else str(parsed_mz).lower()):
-                continue
-            if rt_q and rt_q not in ("" if parsed_rt is None else str(parsed_rt).lower()):
-                continue
-            if annotation_q and annotation_q not in annotation_name.lower():
-                continue
-            if metabolite_q and metabolite_q not in feature_str.lower() and metabolite_q not in annotation_name.lower():
-                continue
-            if has_annotation_q and not annotation_name:
-                continue
+            # Detections among the allowed samples only
+            counts = (index["intensities"] > 0).astype(np.int32) @ allowed.astype(np.int32)
+        dataset["allowed"] = allowed
 
-            present_samples = []
-            for sample_col in sample_cols:
-                intensity = row[sample_col]
-                if pd.isna(intensity):
-                    continue
-                try:
-                    if float(intensity) <= 0:
-                        continue
-                except Exception:
-                    continue
+        mask = counts > 0
+        if row_id_q:
+            mask &= contains(f["q_row_id"], row_id_q).to_numpy()
+        if mz_q:
+            mask &= contains(f["q_mz"], mz_q).to_numpy()
+        if rt_q:
+            mask &= contains(f["q_rt"], rt_q).to_numpy()
+        if annotation_q:
+            mask &= contains(f["q_annotation"], annotation_q).to_numpy()
+        if metabolite_q:
+            mask &= (contains(f["q_metabolite"], metabolite_q) | contains(f["q_annotation"], metabolite_q)).to_numpy()
+        if has_annotation_q:
+            mask &= (f["annotation"] != "").to_numpy()
 
-                lat_val = md_valid.loc[sample_col, "_lat"]
-                lon_val = md_valid.loc[sample_col, "_lon"]
-                if isinstance(lat_val, pd.Series):
-                    lat_val = lat_val.iloc[0]
-                if isinstance(lon_val, pd.Series):
-                    lon_val = lon_val.iloc[0]
+        positions = np.flatnonzero(mask)
+        names = f["metabolite"].to_numpy()[positions]
+        matches.extend(zip(counts[positions].tolist(), names.tolist(), [dataset] * len(positions), positions.tolist()))
 
-                present_samples.append(
-                    {
-                        "dataset": dataset_name,
-                        "dataset_safe": dataset_safe,
-                        "sample_id": str(sample_col),
-                        "lat": float(lat_val),
-                        "lon": float(lon_val),
-                    }
-                )
+    matches.sort(key=lambda m: (m[0], m[1]), reverse=True)
 
-            if not present_samples:
-                continue
-
-            features_out.append(
-                {
-                    "metabolite": feature_str,
-                    "row_id": parsed_row_id,
-                    "row_mz": parsed_mz,
-                    "row_retention_time": parsed_rt,
-                    "annotation": annotation_name or None,
-                    "sample_count": len(present_samples),
-                    "dataset": dataset_name,
-                    "dataset_safe": dataset_safe,
-                    "present_samples": present_samples,
-                }
+    # Sample lists are built only for the features returned.
+    features_out = []
+    measured_samples: dict[str, list[str]] = {}
+    for count, metabolite, dataset, pos in matches[:limit]:
+        index, allowed = dataset["index"], dataset["allowed"]
+        row = index["features"].iloc[pos]
+        sample_ids, lat, lon = index["sample_ids"], index["lat"], index["lon"]
+        intensities = index["intensities"]
+        start, end = intensities.indptr[pos], intensities.indptr[pos + 1]
+        detected = zip(intensities.indices[start:end].tolist(), intensities.data[start:end].tolist())
+        if dataset["safe"] not in measured_samples:
+            # Every mappable sample measures every feature; the map greys out undetected ones.
+            measured_samples[dataset["safe"]] = (
+                list(sample_ids) if allowed is None else [s for s, ok in zip(sample_ids, allowed) if ok]
             )
+        features_out.append(
+            {
+                "metabolite": metabolite,
+                "row_id": row["row_id"],
+                "row_mz": None if pd.isna(row["row_mz"]) else float(row["row_mz"]),
+                "row_retention_time": None if pd.isna(row["row_retention_time"]) else float(row["row_retention_time"]),
+                "annotation": row["annotation"] or None,
+                "sample_count": count,
+                "dataset": dataset["name"],
+                "dataset_safe": dataset["safe"],
+                "present_samples": [
+                    {
+                        "dataset": dataset["name"],
+                        "dataset_safe": dataset["safe"],
+                        "sample_id": sample_ids[i],
+                        "lat": lat[i],
+                        "lon": lon[i],
+                        "intensity": value,
+                    }
+                    for i, value in detected
+                    if allowed is None or allowed[i]
+                ],
+            }
+        )
 
-    features_out.sort(
-        key=lambda x: (x["sample_count"], x["metabolite"]),
-        reverse=True,
+    # Pre-encoded: FastAPI's encoder walks every value, slow for thousands of sample entries.
+    return Response(
+        json.dumps({"features": features_out, "total": len(matches), "measured_samples": measured_samples}),
+        media_type="application/json",
     )
-
-    return {
-        "features": features_out[:limit],
-        "total": len(features_out),
-    }
 
 
 @app.get("/api/map/sample-details")
@@ -1061,7 +1283,7 @@ async def get_map_sample_details(
         row_id = metabolite_id_str.split("_", 1)[0]
         annotation_name = annotation_map.get(row_id)
         if annotation_name and annotation_name != "nan":
-            label = f"{metabolite_id_str} | {annotation_name}"
+            label = f"{metabolite_id_str.split('&', 1)[0]} | {annotation_name}"
         else:
             label = metabolite_id_str
         metabolites.append(
@@ -1089,7 +1311,7 @@ async def get_map_sample_details(
 
 
 @app.get("/api/datasets/{safe_name}/metadata-schema")
-async def get_dataset_metadata_schema(safe_name: str):
+def get_dataset_metadata_schema(safe_name: str):
     dataset_dir = DATASETS_DIR / safe_name
     if not dataset_dir.exists():
         raise HTTPException(404, "Dataset not found")
@@ -1097,11 +1319,19 @@ async def get_dataset_metadata_schema(safe_name: str):
     if not md_path.exists():
         return {"columns": [], "categories": {}, "samples": []}
 
-    md, _ = get_cached_dataset(safe_name, dataset_dir)
+    return _json_response(_cached_stats(
+        _stats_key("metadata-schema", dataset_dir),
+        lambda: _metadata_schema_json(safe_name, dataset_dir),
+    ))
+
+
+def _metadata_schema_json(safe_name: str, dataset_dir: Path) -> str:
+    md, _ = _dataset_frames(safe_name, dataset_dir)
     if md is None:
         raise HTTPException(400, "Dataset files missing")
 
-    md.index = md.index.astype(str)
+    md = _public_md(md, _read_meta(dataset_dir))
+    md = md.set_axis(md.index.astype(str), axis=0)
     metadata_cols = sorted([c for c in md.columns if not c.startswith('_')])
 
     categories = {}
@@ -1110,54 +1340,46 @@ async def get_dataset_metadata_schema(safe_name: str):
         categories[col] = cats
 
     # Build a lightweight list of all samples and their relevant metadata
-    samples_list = []
-    for idx, row in md.iterrows():
-        sample_data = {
-            "sample_id": str(idx),
-        }
-        for col in metadata_cols:
-            val = row.get(col)
-            sample_data[col] = "N/A" if pd.isna(val) else str(val)
-        samples_list.append(sample_data)
+    values = md[metadata_cols]
+    as_text = values.map(str).where(values.notna(), "N/A")
+    samples_list = [
+        {"sample_id": sample_id, **dict(zip(metadata_cols, row))}
+        for sample_id, row in zip(md.index, as_text.itertuples(index=False, name=None))
+    ]
 
-    return {
+    return json.dumps({
         "columns": metadata_cols,
         "categories": categories,
         "samples": samples_list
-    }
+    })
 
 
 @app.get("/api/datasets/{safe_name}/metabolites")
-async def get_dataset_metabolites(safe_name: str):
+def get_dataset_metabolites(safe_name: str):
     dataset_dir = DATASETS_DIR / safe_name
     if not dataset_dir.exists():
         raise HTTPException(404, "Dataset not found")
 
-    ft_path = dataset_dir / "ft.parquet"
-    if not ft_path.exists():
+    _, ft = _dataset_frames(safe_name, dataset_dir)
+    if ft is None:
         raise HTTPException(404, "Feature table missing")
 
-    ft = pd.read_parquet(ft_path)
+    def compute() -> str:
+        # Max intensity (the highest detection signal) of each metabolite, highest first
+        max_intensity = ft.max(axis=1).to_numpy(dtype=float)
+        order = np.argsort(-max_intensity, kind="stable")
+        ids = ft.index.astype(str)
+        return json.dumps({"metabolites": [{"id": ids[i], "max_intensity": float(max_intensity[i])} for i in order]})
 
-    # Calculate max intensity for each metabolite for sorting
-    # Use max() as it represents the highest detection signal
-    metas = []
-    for idx, row in ft.iterrows():
-        metas.append({
-            "id": str(idx),
-            "max_intensity": float(row.max())
-        })
-
-    # Sort by max intensity descending
-    metas.sort(key=lambda x: x["max_intensity"], reverse=True)
-
-    return {"metabolites": metas}
+    return _json_response(_cached_stats(_stats_key("metabolites", dataset_dir), compute))
 
 
 @app.post("/api/datasets/{safe_name}/boxplot-data")
-async def get_boxplot_data(safe_name: str, body: dict):
+def get_boxplot_data(safe_name: str, body: dict):
     metabolite = body.get("metabolite")
     samples = body.get("samples", [])
+    # The dashboard already has every sample's metadata (from metadata-schema) and sends false
+    include_metadata = body.get("include_metadata", True)
 
     if not metabolite:
         raise HTTPException(400, "Metabolite ID is required")
@@ -1166,24 +1388,19 @@ async def get_boxplot_data(safe_name: str, body: dict):
     if not dataset_dir.exists():
         raise HTTPException(404, "Dataset not found")
 
-    ft_path = dataset_dir / "ft.parquet"
-    md_path = dataset_dir / "md.parquet"
-
-    if not ft_path.exists() or not md_path.exists():
+    md, ft = _dataset_frames(safe_name, dataset_dir)
+    if md is None or ft is None:
         raise HTTPException(404, "Dataset files missing")
 
-    ft = pd.read_parquet(ft_path)
-    md = _public_md(pd.read_parquet(md_path), _read_meta(dataset_dir))
-
-    if metabolite not in ft.index:
+    if metabolite in ft.index:
+        row = ft.loc[metabolite]
+    else:
         # Try fuzzy match if exact fails (e.g. string vs int index)
-        ft.index = ft.index.astype(str)
-        if str(metabolite) not in ft.index:
+        matches = np.flatnonzero(ft.index.astype(str) == str(metabolite))
+        if not len(matches):
             raise HTTPException(404, f"Metabolite '{metabolite}' not found in dataset")
         metabolite = str(metabolite)
-
-    # Get intensities for the metabolite
-    row = ft.loc[metabolite]
+        row = ft.iloc[matches[0]]
 
     # If samples are provided, filter by them
     if samples:
@@ -1193,22 +1410,19 @@ async def get_boxplot_data(safe_name: str, body: dict):
         intensities = row[available_samples]
     else:
         intensities = row
+    intensities = intensities[intensities.notna()]
+
+    sample_meta = _boxplot_sample_metadata(safe_name, dataset_dir, md) if include_metadata else {}
 
     # Prepare data for boxplot: list of {sample: ID, intensity: VAL, metadata: ...}
-    plot_data = []
-    for sample_id, val in intensities.items():
-        if pd.isna(val):
-            continue
-
-        sample_meta = {}
-        if sample_id in md.index:
-            sample_meta = md.loc[sample_id].to_dict()
-
-        plot_data.append({
+    plot_data = [
+        {
             "sample_id": str(sample_id),
             "intensity": float(val),
-            "metadata": {str(k): str(v) for k, v in sample_meta.items() if not str(k).startswith('_')}
-        })
+            "metadata": sample_meta.get(sample_id, {}),
+        }
+        for sample_id, val in intensities.items()
+    ]
 
     return {
         "metabolite": metabolite,
@@ -1216,8 +1430,119 @@ async def get_boxplot_data(safe_name: str, body: dict):
     }
 
 
+def _boxplot_sample_metadata(safe_name: str, dataset_dir: Path, md: pd.DataFrame) -> dict:
+    """sample id → {public metadata column: value as text}."""
+    def compute() -> dict:
+        public = _public_md(md, _read_meta(dataset_dir))
+        cols = [c for c in public.columns if not str(c).startswith('_')]
+        names = [str(c) for c in cols]
+        return {
+            sample_id: {k: str(v) for k, v in zip(names, row)}
+            for sample_id, row in zip(public.index, public[cols].itertuples(index=False, name=None))
+        }
+    return _cached_stats(_stats_key("boxplot-metadata", dataset_dir), compute)
+
+
+# Metrics where the distance between two samples depends only on those two samples (features
+# absent from both add nothing), so a distance matrix for any sample subset can be cut out of
+# one whole-dataset matrix instead of being recomputed for every filter change.
+SUBSET_INVARIANT_METRICS = {
+    "braycurtis", "canberra", "chebyshev", "cityblock", "cosine",
+    "euclidean", "jaccard", "minkowski", "sqeuclidean",
+}
+
+
+def _pairwise_distances(X: np.ndarray, metric: str) -> np.ndarray:
+    """squareform(pdist(X, metric)), computed in row blocks across CPU cores (cdist releases the GIL)."""
+    from scipy.spatial import distance as scipy_distance
+
+    n = X.shape[0]
+    D = np.zeros((n, n))
+    step = 32
+
+    def fill_upper(i: int) -> None:
+        j = min(i + step, n)
+        D[i:j, i:] = scipy_distance.cdist(X[i:j], X[i:], metric=metric)
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+        list(pool.map(fill_upper, range(0, n, step)))
+    lower = np.tril_indices(n, -1)
+    D[lower] = D.T[lower]
+    np.fill_diagonal(D, 0.0)
+    return D
+
+
+def _full_distance_matrix(dataset_safe: str, dataset_dir: Path, ft: pd.DataFrame, metric: str):
+    """(sample ids, distances between every pair of samples in ft), cached in memory and on disk."""
+    mtime_ft = (dataset_dir / "ft.parquet").stat().st_mtime
+    key = (dataset_safe, mtime_ft, metric)
+    with _cache_lock:
+        lock = _dist_locks.setdefault(key, threading.Lock())
+    with lock:
+        cached = _lru_get(DIST_CACHE, key)
+        if cached is not None:
+            return cached
+
+        ids = np.array([str(c) for c in ft.columns])
+        cache_path = dataset_dir / DIST_CACHE_DIRNAME / f"dist_{metric}.npz"
+        result = None
+        if cache_path.exists():
+            try:
+                with np.load(cache_path) as saved:
+                    if float(saved["mtime_ft"]) == mtime_ft and np.array_equal(saved["ids"], ids):
+                        result = (ids, saved["D"])
+            except (OSError, ValueError, KeyError):
+                result = None
+        if result is None:
+            X = ft.T.fillna(0.0).to_numpy(dtype=float)
+            result = (ids, _pairwise_distances(X, metric))
+            try:
+                cache_path.parent.mkdir(exist_ok=True)
+                tmp_path = cache_path.with_name(f"tmp_{os.getpid()}_{cache_path.name}")
+                np.savez(tmp_path, D=result[1], ids=ids, mtime_ft=mtime_ft)
+                os.replace(tmp_path, cache_path)
+            except OSError:
+                pass
+        _lru_put(DIST_CACHE, key, result, DIST_CACHE_MAX)
+        return result
+
+
+def _sample_distance_matrix(dataset_safe: str, dataset_dir: Path, ft: pd.DataFrame, samples: list, metric: str):
+    """skbio DistanceMatrix between `samples` (feature-table column names as text)."""
+    ft_cols = [str(c) for c in ft.columns]
+    if metric in SUBSET_INVARIANT_METRICS and len(set(ft_cols)) == len(ft_cols):
+        ids, D = _full_distance_matrix(dataset_safe, dataset_dir, ft, metric)
+        pos = {s: i for i, s in enumerate(ids)}
+        idx = np.array([pos[s] for s in samples])
+        sub = D[np.ix_(idx, idx)]
+    else:
+        from scipy.spatial import distance as scipy_distance
+
+        col_pos = {c: i for i, c in enumerate(ft_cols)}
+        X = ft.iloc[:, [col_pos[s] for s in samples]].T.fillna(0.0)
+        # Filter out features with all zeros (to avoid zero variance/distance issues)
+        X = X.loc[:, (X != 0).any(axis=0)]
+        sub = scipy_distance.squareform(scipy_distance.pdist(X.values, metric=metric))
+    return skbio.stats.distance.DistanceMatrix(sub, ids=list(samples))
+
+
+def _permanova_records(distance_matrix, groups: pd.Series) -> list:
+    """PERMANOVA over the samples in `groups` (a subset of the distance matrix's samples)."""
+    distance_matrix = distance_matrix.filter(list(groups.index))
+    permanova = skbio.stats.distance.permanova(distance_matrix, groups)
+    # R² = SS_between / SS_total. With pseudo-F = (SS_between / (k - 1)) / (SS_within / (N - k)),
+    # SS_between / SS_within = F (k - 1) / (N - k), so R² = 1 - 1 / (1 + F (k - 1) / (N - k)).
+    k = permanova["number of groups"]
+    n = permanova["sample size"]
+    permanova["R2"] = 1 - 1 / (1 + permanova["test statistic"] * (k - 1) / (n - k))
+    permanova_res = permanova.to_frame(name="PERMANOVA results").reset_index()
+    permanova_res.columns = ["Metric", "Value"]
+    permanova_res["Value"] = permanova_res["Value"].apply(lambda x: str(x) if not isinstance(x, (int, float)) else x)
+    return permanova_res.to_dict(orient="records")
+
+
 @app.post("/api/map/pcoa")
-async def run_map_pcoa(body: dict):
+def run_map_pcoa(body: dict):
     dataset_safe = body.get("dataset_safe")
     if not dataset_safe:
         raise HTTPException(400, "dataset_safe is required")
@@ -1226,13 +1551,21 @@ async def run_map_pcoa(body: dict):
     if not dataset_dir.exists():
         raise HTTPException(404, "Dataset not found")
 
-    md, ft = get_cached_dataset(dataset_safe, dataset_dir)
+    # Building the Plotly figures alone takes a second or two on large datasets, so whole
+    # responses are cached too: going back to an earlier set of options is instant.
+    key = _stats_key("pcoa", dataset_dir, json.dumps(body, sort_keys=True, default=str))
+    return _json_response(_cached_stats(
+        key, lambda: json.dumps(_pcoa_result(body, dataset_safe, dataset_dir), allow_nan=False)
+    ))
+
+
+def _pcoa_result(body: dict, dataset_safe: str, dataset_dir: Path) -> dict:
+    md, ft = _dataset_frames(dataset_safe, dataset_dir)
     if md is None or ft is None:
         raise HTTPException(400, "Dataset files missing")
 
+    md = _public_md(md, _read_meta(dataset_dir)).copy()
     md.index = md.index.astype(str)
-    ft.columns = [str(c) for c in ft.columns]
-    ft.index = ft.index.astype(str)
 
     # Resolve filename or _sample_id
     md_reset = md.reset_index()
@@ -1266,7 +1599,7 @@ async def run_map_pcoa(body: dict):
         all_categories = sorted([str(x) for x in md[attribute].dropna().unique() if str(x).strip() != ''])
 
     # Filtering samples
-    filtered_md = md.copy()
+    filtered_md = md
     if attribute and attribute in filtered_md.columns:
         filtered_md = filtered_md[filtered_md[attribute].notna()]
         if selected_categories is not None:
@@ -1274,10 +1607,12 @@ async def run_map_pcoa(body: dict):
 
     # Use the sample mapping logic to ensure robust sample ID matching
     if selected_samples is not None:
-        # Match selected_samples against the resolved _sample_id
-        filtered_md = filtered_md[filtered_md["_sample_id"].isin(selected_samples)]
+        # The dashboard sends metadata row IDs (as in metadata-schema); also accept the resolved _sample_id
+        filtered_md = filtered_md[
+            filtered_md.index.isin(selected_samples) | filtered_md["_sample_id"].isin(selected_samples)
+        ]
 
-    sample_cols = [c for c in ft.columns if c in filtered_md.index]
+    sample_cols = [str(c) for c in ft.columns if str(c) in filtered_md.index]
 
     if len(sample_cols) < 2:
         return {
@@ -1287,51 +1622,50 @@ async def run_map_pcoa(body: dict):
             "error": "At least 2 samples are required to perform PCoA. Currently only " + str(len(sample_cols)) + " sample(s) available after filtering."
         }
 
-    # Extract and transpose feature table
-    X_df = ft[sample_cols].T.fillna(0.0)
-    # Filter out features with all zeros (to avoid zero variance/distance issues)
-    X_df = X_df.loc[:, (X_df != 0).any(axis=0)]
+    # Sorted to match FBMN-STATS-Webapp behavior exactly
+    sorted_samples = sorted(sample_cols)
 
-    # Sort index to match FBMN-STATS-Webapp behavior exactly
-    X_df.sort_index(inplace=True)
-
-    perm_md = filtered_md[filtered_md[color_by].notna()].copy()
-    perm_md.sort_index(inplace=True)
+    # PERMANOVA tests the samples in the analysis that have a value for the grouping column
+    perm_md = filtered_md.loc[sorted_samples]
+    perm_md = perm_md[perm_md[color_by].notna()]
 
     n_unique = perm_md[color_by].nunique()
     min_per_cat = perm_md[color_by].value_counts().min() if n_unique > 0 else 0
     can_permanova = n_unique >= 2 and min_per_cat >= 2
 
-    # Check PCoA Eigendecomposition and Distance Matrix Cache
-    # We must sort sample_cols here to ensure cache key matches
-    sorted_samples = tuple(X_df.index)
-    cache_key = (dataset_safe, distance_metric, sorted_samples)
-    pcoa = PCOA_CACHE.get(cache_key)
-
-    permanova_df = None
+    # PCoA depends on the samples and metric; PERMANOVA also on the grouping column.
+    # Both are cached, so changing only axes or colours (or going back to an earlier
+    # selection) skips the distance matrix, the eigendecomposition and the permutations.
+    cache_key = (dataset_safe, _stats_key("pcoa", dataset_dir)[2], distance_metric, tuple(sorted_samples))
+    permanova_key = cache_key + (color_by,)
+    pcoa = _lru_get(PCOA_CACHE, cache_key)
+    permanova_df = _lru_get(PERMANOVA_CACHE, permanova_key) if can_permanova else None
 
     try:
-        from scipy.spatial import distance as scipy_distance
-        # Compute distance matrix
-        d_vals = scipy_distance.pdist(X_df.values, metric=distance_metric)
-        D = scipy_distance.squareform(d_vals)
-        distance_matrix = skbio.stats.distance.DistanceMatrix(
-            D,
-            ids=X_df.index,
-        )
-
-        if pcoa is None:
-            pcoa = skbio.stats.ordination.pcoa(distance_matrix)
-            PCOA_CACHE[cache_key] = pcoa
-
-        if can_permanova:
-            permanova_groups = perm_md.loc[X_df.index, color_by]
-            permanova = skbio.stats.distance.permanova(distance_matrix, permanova_groups)
-            permanova["R2"] = 1 - 1 / (1 + permanova["test statistic"] * permanova["number of groups"] / (permanova["sample size"] - permanova["number of groups"] - 1))
-            permanova_res = permanova.to_frame(name="PERMANOVA results").reset_index()
-            permanova_res.columns = ["Metric", "Value"]
-            permanova_res["Value"] = permanova_res["Value"].apply(lambda x: str(x) if not isinstance(x, (int, float)) else x)
-            permanova_df = permanova_res.to_dict(orient="records")
+        if pcoa is None or (can_permanova and permanova_df is None):
+            distance_matrix = _sample_distance_matrix(dataset_safe, dataset_dir, ft, sorted_samples, distance_metric)
+            # The eigendecomposition and the permutation test are independent: run them side by side
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                # Only PC1-PC10 are ever shown, so a partial eigendecomposition (O(n²k) rather than
+                # O(n³)) is enough; skbio still takes proportions explained from the full trace
+                pcoa_job = (
+                    pool.submit(
+                        skbio.stats.ordination.pcoa,
+                        distance_matrix,
+                        dimensions=min(10, distance_matrix.shape[0]),
+                    )
+                    if pcoa is None else None
+                )
+                permanova_job = None
+                if can_permanova and permanova_df is None:
+                    permanova_groups = perm_md[color_by].astype(str)
+                    permanova_job = pool.submit(_permanova_records, distance_matrix, permanova_groups)
+                if pcoa_job is not None:
+                    pcoa = pcoa_job.result()
+                    _lru_put(PCOA_CACHE, cache_key, pcoa, PCOA_CACHE_MAX)
+                if permanova_job is not None:
+                    permanova_df = permanova_job.result()
+                    _lru_put(PERMANOVA_CACHE, permanova_key, permanova_df, PCOA_CACHE_MAX)
 
     except Exception as e:
         return {
@@ -1405,23 +1739,28 @@ async def run_map_pcoa(body: dict):
     )
 
     # Prepare sample details for coordinates
-    coordinate_details = []
-    for s_id in sample_cols:
-        row_coords = pcoa.samples.loc[s_id].to_dict()
-        row_md = filtered_md.loc[s_id]
-        color_val = str(row_md.get(color_by, "N/A")) if color_by else "N/A"
-        shape_val = str(row_md.get(attribute, "N/A")) if attribute else "N/A"
-        coordinate_details.append({
+    pc_names = [f"PC{k+1}" for k in range(top_k)]
+    coords = pcoa.samples.reindex(index=sample_cols, columns=pc_names).fillna(0.0).to_numpy(dtype=float)
+    sample_md = filtered_md.loc[sample_cols]
+
+    def column_text(col):
+        if not col or col not in sample_md.columns:
+            return ["N/A"] * len(sample_cols)
+        return [str(v) for v in sample_md[col]]
+
+    coordinate_details = [
+        {
             "sample_id": s_id,
             "color_value": color_val,
             "shape_value": shape_val,
-            "coordinates": {f"PC{k+1}": float(row_coords.get(f"PC{k+1}", 0.0)) for k in range(top_k)}
-        })
+            "coordinates": dict(zip(pc_names, row_coords)),
+        }
+        for s_id, color_val, shape_val, row_coords in zip(
+            sample_cols, column_text(color_by), column_text(attribute), coords.tolist()
+        )
+    ]
 
-    # Replace NaN values with "N/A" for JSON serialization compliance
-    filtered_metadata_records = filtered_md.reset_index().fillna("N/A").to_dict(orient="records")
-
-    return {
+    result = {
         "all_sample_ids": all_sample_ids,
         "metadata_columns": metadata_cols,
         "all_categories": all_categories,
@@ -1430,18 +1769,22 @@ async def run_map_pcoa(body: dict):
         "variance_plot": json.loads(fig_var.to_json()),
         "proportion_explained": pcoa.proportion_explained.tolist(),
         "permanova": permanova_df,
-        "filtered_metadata": filtered_metadata_records
     }
+    # Every filtered sample's full metadata is large and the dashboard does not use it
+    if body.get("include_filtered_metadata"):
+        # Replace NaN values with "N/A" for JSON serialization compliance
+        result["filtered_metadata"] = filtered_md.reset_index().fillna("N/A").to_dict(orient="records")
+    return result
 
 
 @app.get("/api/datasets/{safe_name}/ranges")
-async def get_dataset_ranges(safe_name: str):
+def get_dataset_ranges(safe_name: str):
     """m/z and RT ranges parsed from feature labels (ID_mz@RT) — used as heatmap filter bounds."""
     dataset_dir = DATASETS_DIR / safe_name
     if not dataset_dir.exists():
         raise HTTPException(404, "Dataset not found")
 
-    _, ft = get_cached_dataset(safe_name, dataset_dir)
+    _, ft = _dataset_frames(safe_name, dataset_dir)
     if ft is None:
         raise HTTPException(404, "Feature table missing")
 
@@ -1651,12 +1994,17 @@ def _formula_from_inchi(inchi: str) -> Optional[str]:
     return None
 
 
+_MISSING_SMILES = frozenset({"nan", "none", "null", "n/a", "na", "-", "--", "?", "unknown"})
+
+
+@lru_cache(maxsize=65536)
 def _formula_from_smiles(smiles: str) -> Optional[str]:
     """Convert a SMILES string to a molecular formula (requires RDKit)."""
     if not _RDKIT_AVAILABLE or not isinstance(smiles, str):
         return None
     smi = smiles.strip()
-    if not smi or smi.lower() == "nan":
+    # Missing values arrive as placeholder text ("nan", "N/A", ...); RDKit would only fail on them
+    if not smi or smi.lower() in _MISSING_SMILES:
         return None
     try:
         mol = _rd_Chem.MolFromSmiles(smi)
@@ -1715,8 +2063,12 @@ def _get_annotated_scans(
         s = an[inchi_col].astype(str).str.strip()
         has_formula |= s.str.startswith("InChI=") & s.str.contains("/") & s.str.split("/").str[1].str.strip().ne("")
     if smiles_col and _RDKIT_AVAILABLE:
-        s = an[smiles_col].astype(str).str.strip()
-        has_formula |= s.ne("") & s.str.lower().ne("nan")
+        # Only SMILES that RDKit can turn into a formula count (missing values read as "None")
+        mask = has_formula.to_numpy(copy=True)
+        smiles = an[smiles_col].to_numpy()
+        for i in np.flatnonzero(~mask):
+            mask[i] = _formula_from_smiles(smiles[i]) is not None
+        has_formula = pd.Series(mask, index=an.index)
 
     if not include_msbuddy:
         if "SpectrumID" in an.columns:
@@ -1732,64 +2084,53 @@ def _get_annotated_scans(
     return scans
 
 
-def calculate_ratios_from_formula(formula: str) -> tuple[Optional[float], Optional[float]]:
+def _element_counts(formula: str) -> dict:
+    """Atom counts of a molecular formula such as 'C6H12O6'.
+
+    Salts and hydrates are written as dot-separated parts ('C37H36N2O9S3.2H3N'); only the
+    part with the most carbon atoms (the organic molecule) is counted, so counter-ions and
+    water do not shift its ratios.
+    """
     if not isinstance(formula, str) or not formula or pd.isna(formula):
-        return None, None
-    pattern = r'([A-Z][a-z]*)(\d*)'
-    matches = re.findall(pattern, formula)
-    
-    counts = {}
-    for elem, count_str in matches:
-        count = int(count_str) if count_str else 1
-        counts[elem] = counts.get(elem, 0) + count
-        
+        return {}
+    best: dict = {}
+    for part in formula.split("."):
+        counts: dict = {}
+        # Leading multipliers ('2H3N') are skipped: only the matched element symbols are read
+        for elem, count_str in re.findall(r'([A-Z][a-z]?)(\d*)', part):
+            counts[elem] = counts.get(elem, 0) + (int(count_str) if count_str else 1)
+        if counts.get('C', 0) > best.get('C', 0):
+            best = counts
+    return best
+
+
+def calculate_ratios_from_formula(formula: str) -> tuple[Optional[float], Optional[float]]:
+    """(O/C, H/C) atomic ratios for the Van Krevelen diagram."""
+    counts = _element_counts(formula)
     c = counts.get('C', 0)
-    h = counts.get('H', 0)
-    o = counts.get('O', 0)
-    
     if c == 0:
         return None, None
-        
-    return o / c, h / c
+    return counts.get('O', 0) / c, counts.get('H', 0) / c
 
 
 def calculate_carbon_oxidation_state(formula: str) -> Optional[float]:
-    """Calculate Carbon Oxidation State (COS) from molecular formula.
-    
-    COS = (2*O + N - H) / C
-    
-    Returns COS value or None if formula is invalid.
+    """Nominal oxidation state of carbon (NOSC; LaRowe & Van Cappellen 2011) of a neutral molecule.
+
+    NOSC = 4 - (4C + H - 3N - 2O + 5P - 2S) / C
+
+    i.e. H at +1, N at -3, O at -2, P at +5 and S at -2. Other elements are not counted.
+    Returns None if the formula has no carbon.
     """
-    if not isinstance(formula, str) or not formula or pd.isna(formula):
-        return None
-    pattern = r'([A-Z][a-z]*)(\d*)'
-    matches = re.findall(pattern, formula)
-    
-    counts = {}
-    for elem, count_str in matches:
-        count = int(count_str) if count_str else 1
-        counts[elem] = counts.get(elem, 0) + count
-        
+    counts = _element_counts(formula)
     c = counts.get('C', 0)
     if c == 0:
         return None
-    
-    o = counts.get('O', 0)
-    n = counts.get('N', 0)
-    h = counts.get('H', 0)
-    
-    return (2 * o + n - h) / c
+    h, n, o, p, s = (counts.get(e, 0) for e in ('H', 'N', 'O', 'P', 'S'))
+    return 4 - (4 * c + h - 3 * n - 2 * o + 5 * p - 2 * s) / c
 
 
 def classify_by_formula_ratios(formula: str, o_c: float, h_c: float) -> str:
-    pattern = r'([A-Z][a-z]*)(\d*)'
-    matches = re.findall(pattern, formula)
-    counts = {}
-    for elem, count_str in matches:
-        count = int(count_str) if count_str else 1
-        counts[elem] = counts.get(elem, 0) + count
-        
-    n = counts.get('N', 0)
+    n = _element_counts(formula).get('N', 0)
     
     if o_c < 0.3 and h_c >= 1.5:
         return "Lipids"
@@ -1824,8 +2165,132 @@ def apply_fdr_correction(p_values: list[float]) -> list[float]:
     return adj_ps
 
 
+# Compound class columns of the annotation table (CANOPUS / NPClassifier), used to group plot points
+CLASS_COLUMNS = (
+    "superclass", "class", "subclass",
+    "npclassifier_superclass", "npclassifier_class", "npclassifier_pathway",
+)
+
+
+def _class_label(value) -> str:
+    """A class name, or 'Unclassified' when the column is missing or the value is empty."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return "Unclassified"
+    text = str(value).strip()
+    return "Unclassified" if text.lower() in ("", "nan", "none") else text
+
+
+def _top_formula_rows(safe_name: str, dataset_dir: Path, show_msbuddy: bool) -> dict:
+    """Shared by the Van Krevelen and Carbon Oxidation State plots: annotation rows with a
+    molecular formula for the 1,000 most intense annotated features (by mean intensity over
+    biological samples), plus feature counts. Cached until the dataset changes."""
+    def compute() -> dict:
+        an = _annotation_frame(safe_name, dataset_dir)
+        md, ft = _dataset_frames(safe_name, dataset_dir)
+        if an is None or ft is None:
+            return {"missing": True}
+        # Blanks/controls are found from all metadata columns, including ones not made public:
+        # only the resulting mean intensities are returned, never the hidden values.
+        if ft.empty:
+            return {"empty": True}
+
+        scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
+        formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
+        inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
+        smiles_col = next((c for c in an.columns if c.lower() in ("smiles", "smile")), None)
+
+        # Scans carrying a formula from ANY source (SIRIUS/ZODIAC, library match, InChI, SMILES)
+        annotated_scans = _get_annotated_scans(an, scan_col, formula_col, include_msbuddy=show_msbuddy)
+
+        # Text labels on a shallow copy: the cached table itself is never modified
+        ft = ft.copy(deep=False)
+        ft.index = ft.index.astype(str)
+        ft.columns = [str(c) for c in ft.columns]
+
+        # Isolate biological samples from blanks/controls
+        blank_samples = set()
+        if not md.empty:
+            for col in md.columns:
+                try:
+                    series_str = md[col].astype(str).str.lower()
+                    matches = md.index[series_str.str.contains("blank|control|qc|solvent|media", regex=True)]
+                    blank_samples.update(matches.astype(str))
+                except Exception: continue
+        bio_samples_idx = md.index.difference(blank_samples)
+        bio_samples = [c for c in ft.columns if c in bio_samples_idx]
+        if not bio_samples: bio_samples = list(ft.columns)
+
+        # Pre-extract and normalize row IDs
+        rids = [str(k).split("_")[0] for k in ft.index.values]
+        rids = [rid[:-2] if rid.endswith(".0") else rid for rid in rids]
+
+        # Filter for annotated features
+        is_annotated = np.array([rid in annotated_scans for rid in rids], dtype=bool)
+        ft_filtered = ft.loc[is_annotated]
+
+        # Calculate mean intensities over biological samples
+        if not ft_filtered.empty and bio_samples:
+            mean_intensities = ft_filtered[bio_samples].mean(axis=1).fillna(0.0).to_dict()
+        else:
+            mean_intensities = {}
+
+        # Sort by mean intensity descending and take top 1000
+        sirius_features = [(f_key, mean_intensities.get(f_key, 0.0)) for f_key in ft_filtered.index]
+        sirius_features.sort(key=lambda x: x[1], reverse=True)
+        top_keys = [item[0] for item in sirius_features[:1000]]
+
+        row_id_to_full = {}
+        for k in top_keys:
+            rid = str(k).split("_")[0]
+            if rid.endswith(".0"): rid = rid[:-2]
+            row_id_to_full[rid] = k
+
+        # Pre-filter annotation table for top features
+        an_scans_str = an[scan_col].astype(str).values if scan_col else []
+        normalized_scans = [s[:-2] if s.endswith(".0") else s for s in an_scans_str]
+        an_keep_mask = np.array([s in row_id_to_full for s in normalized_scans], dtype=bool)
+        an_subset = an.loc[an_keep_mask] if len(an_keep_mask) else an.iloc[0:0]
+
+        name_col = next((c for c in ["Compound_Name", "compound_name", "name", "Name"] if c in an.columns), None)
+
+        rows = []
+        for _, row in an_subset.iterrows():
+            rid = str(row[scan_col]) if scan_col else ""
+            if rid.endswith(".0"): rid = rid[:-2]
+            if rid not in row_id_to_full: continue
+
+            # Skip MSBuddy annotations unless requested
+            is_msbuddy = str(row.get("SpectrumID", "")).startswith("MSB_") or str(row.get("Compound_Name", "")).startswith("MSBuddy:")
+            if is_msbuddy and not show_msbuddy:
+                continue
+
+            # Extract formula (formula column → InChI → SMILES)
+            formula, formula_source = _resolve_row_formula(row, formula_col, inchi_col, smiles_col)
+            if not formula:
+                continue
+
+            f_key = row_id_to_full[rid]
+            rows.append({
+                "metabolite": f_key,
+                "row_id": rid,
+                "formula": formula,
+                "formula_source": "msbuddy" if is_msbuddy else formula_source,
+                "compound_name": str(row[name_col]) if name_col and not pd.isna(row[name_col]) else "",
+                "intensity": mean_intensities.get(f_key, 1.0),
+                **{col: _class_label(row.get(col)) for col in CLASS_COLUMNS},
+            })
+
+        return {
+            "rows": rows,
+            "total_features": int(ft.shape[0]),
+            "annotated_features": int(is_annotated.sum()),
+        }
+
+    return _cached_stats(_stats_key("formula-rows", dataset_dir, bool(show_msbuddy)), compute)
+
+
 @app.get("/api/datasets/{safe_name}/vankrevelen")
-async def get_dataset_vankrevelen(
+def get_dataset_vankrevelen(
     safe_name: str,
     show_msbuddy: bool = False
 ):
@@ -1833,126 +2298,35 @@ async def get_dataset_vankrevelen(
     if not dataset_dir.exists():
         raise HTTPException(404, f"Dataset {safe_name} not found")
 
-    an_path = dataset_dir / "an.parquet"
-    ft_path = dataset_dir / "ft.parquet"
-    md_path = dataset_dir / "md.parquet"
-    meta_path = dataset_dir / "meta.json"
+    def compute() -> str:
+        base = _top_formula_rows(safe_name, dataset_dir, show_msbuddy)
+        if base.get("missing"):
+            return json.dumps({
+                "points": [], "total_points": 0, "message": "Required files missing.",
+                "unannotated_significant_count": 0, "total_features": 0
+            })
+        if base.get("empty"):
+            return json.dumps({"points": [], "total_points": 0, "total_features": 0})
 
-    if not an_path.exists() or not ft_path.exists():
-        return {
-            "points": [], "total_points": 0, "message": "Required files missing.",
-            "unannotated_significant_count": 0, "total_features": 0
-        }
+        points = []
+        for row in base["rows"]:
+            o_c, h_c = calculate_ratios_from_formula(row["formula"])
+            if o_c is None or h_c is None: continue
+            points.append({**row, "o_c": o_c, "h_c": h_c})
 
-    an = pd.read_parquet(an_path)
-    ft = pd.read_parquet(ft_path)
-    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    md = _public_md(pd.read_parquet(md_path), meta) if md_path.exists() else pd.DataFrame()
-
-    if ft.empty:
-        return {"points": [], "total_points": 0, "total_features": 0}
-
-    scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
-    formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
-    inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
-    smiles_col = next((c for c in an.columns if c.lower() in ("smiles", "smile")), None)
-
-    # Scans carrying a formula from ANY source (SIRIUS/ZODIAC, library match, InChI, SMILES)
-    annotated_scans = _get_annotated_scans(an, scan_col, formula_col, include_msbuddy=show_msbuddy)
-
-    ft.index = ft.index.astype(str)
-    ft.columns = [str(c) for c in ft.columns]
-
-    # Isolate sample data from background blanks and control solutions
-    blank_samples = set()
-    if not md.empty:
-        for col in md.columns:
-            try:
-                series_str = md[col].astype(str).str.lower()
-                matches = md.index[series_str.str.contains("blank|control|qc|solvent|media", regex=True)]
-                blank_samples.update(matches.astype(str))
-            except Exception: continue
-    bio_samples_idx = md.index.difference(blank_samples)
-    bio_samples = [c for c in ft.columns if c in bio_samples_idx]
-    if not bio_samples: bio_samples = list(ft.columns)
-
-    # Pre-extract and normalize row IDs
-    f_keys = ft.index.values
-    rids = [str(k).split("_")[0] for k in f_keys]
-    rids = [rid[:-2] if rid.endswith(".0") else rid for rid in rids]
-
-    # Create true biological annotated mask
-    is_annotated = np.array([rid in annotated_scans for rid in rids])
-    ft_filtered = ft.loc[is_annotated]
-
-    # Vectorized mean calculation over bio_samples (instantaneous in pandas!)
-    if not ft_filtered.empty and bio_samples:
-        mean_intensities = ft_filtered[bio_samples].mean(axis=1).fillna(0.0).to_dict()
-    else:
-        mean_intensities = {}
-
-    # Gather features with non-zero pre-computed mean intensities
-    sirius_features = [(f_key, mean_intensities.get(f_key, 0.0)) for f_key in ft_filtered.index]
-
-    # Sort descending by mean intensity/abundance and slice the top 1000
-    sirius_features.sort(key=lambda x: x[1], reverse=True)
-    top_keys = [item[0] for item in sirius_features[:1000]]
-
-    row_id_to_full = {}
-    for k in top_keys:
-        rid = str(k).split("_")[0]
-        if rid.endswith(".0"): rid = rid[:-2]
-        row_id_to_full[rid] = k
-
-    # Pre-filter 'an' rows vectorially for maximum loop efficiency
-    an_scans_str = an[scan_col].astype(str).values if scan_col else []
-    normalized_scans = [s[:-2] if s.endswith(".0") else s for s in an_scans_str]
-    unique_row_ids_to_keep = set(row_id_to_full.keys())
-
-    an_keep_mask = np.array([s in unique_row_ids_to_keep for s in normalized_scans])
-    an_subset = an.loc[an_keep_mask]
-
-    points = []
-    name_col = next((c for c in ["Compound_Name", "compound_name", "name", "Name"] if c in an.columns), None)
-
-    for _, row in an_subset.iterrows():
-        rid = str(row[scan_col]) if scan_col else ""
-        if rid.endswith(".0"): rid = rid[:-2]
-        if rid not in row_id_to_full: continue
-        f_key = row_id_to_full[rid]
-        is_msbuddy = str(row.get("SpectrumID", "")).startswith("MSB_") or str(row.get("Compound_Name", "")).startswith("MSBuddy:")
-        if is_msbuddy and not show_msbuddy:
-            continue
-
-        formula, formula_source = _resolve_row_formula(row, formula_col, inchi_col, smiles_col)
-        if not formula: continue
-        o_c, h_c = calculate_ratios_from_formula(formula)
-        if o_c is None or h_c is None: continue
-
-        points.append({
-            "metabolite": f_key, "row_id": rid, "formula": formula, "o_c": o_c, "h_c": h_c,
-            "formula_source": "msbuddy" if is_msbuddy else formula_source,
-            "compound_name": str(row[name_col]) if name_col and not pd.isna(row[name_col]) else "",
-            "intensity": mean_intensities.get(f_key, 1.0),
-            "superclass": str(row.get("superclass", "Unclassified")),
-            "class": str(row.get("class", "Unclassified")),
-            "subclass": str(row.get("subclass", "Unclassified")),
-            "npclassifier_superclass": str(row.get("npclassifier_superclass", "Unclassified")),
-            "npclassifier_class": str(row.get("npclassifier_class", "Unclassified")),
-            "npclassifier_pathway": str(row.get("npclassifier_pathway", "Unclassified"))
+        return json.dumps({
+            "points": points, "total_points": len(points),
+            "unannotated_significant_count": 0,
+            "total_features": base["total_features"],
+            "annotated_features": base["annotated_features"],
+            "msbuddy_included": bool(show_msbuddy),
         })
 
-    return {
-        "points": points, "total_points": len(points),
-        "unannotated_significant_count": 0,
-        "total_features": int(ft.shape[0]),
-        "annotated_features": int(is_annotated.sum()),
-        "msbuddy_included": bool(show_msbuddy),
-    }
+    return _json_response(_cached_stats(_stats_key("vankrevelen", dataset_dir, bool(show_msbuddy)), compute))
 
 
 @app.get("/api/datasets/{safe_name}/carbon-ox-state")
-async def get_dataset_carbon_ox_state(safe_name: str, show_msbuddy: bool = False):
+def get_dataset_carbon_ox_state(safe_name: str, show_msbuddy: bool = False):
     """
     Get Carbon Oxidation State (COS) data for annotated features.
 
@@ -1962,145 +2336,44 @@ async def get_dataset_carbon_ox_state(safe_name: str, show_msbuddy: bool = False
     if not dataset_dir.exists():
         raise HTTPException(404, f"Dataset {safe_name} not found")
 
-    an_path = dataset_dir / "an.parquet"
-    ft_path = dataset_dir / "ft.parquet"
-    md_path = dataset_dir / "md.parquet"
-    meta_path = dataset_dir / "meta.json"
+    def compute() -> str:
+        base = _top_formula_rows(safe_name, dataset_dir, show_msbuddy)
+        if base.get("missing"):
+            return json.dumps({
+                "points": [], "total_points": 0, "message": "Required files missing.",
+                "total_features": 0
+            })
+        if base.get("empty"):
+            return json.dumps({"points": [], "total_points": 0, "total_features": 0})
 
-    if not an_path.exists() or not ft_path.exists():
-        return {
-            "points": [], "total_points": 0, "message": "Required files missing.",
-            "total_features": 0
-        }
+        points = []
+        for row in base["rows"]:
+            cos = calculate_carbon_oxidation_state(row["formula"])
+            if cos is None: continue
+            points.append({**row, "cos": cos})
 
-    an = pd.read_parquet(an_path)
-    ft = pd.read_parquet(ft_path)
-    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    md = _public_md(pd.read_parquet(md_path), meta) if md_path.exists() else pd.DataFrame()
-
-    if ft.empty:
-        return {"points": [], "total_points": 0, "total_features": 0}
-
-    scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
-    formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
-    inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
-    smiles_col = next((c for c in an.columns if c.lower() in ("smiles", "smile")), None)
-
-    # Scans carrying a formula from ANY source (SIRIUS/ZODIAC, library match, InChI, SMILES)
-    annotated_scans = _get_annotated_scans(an, scan_col, formula_col, include_msbuddy=show_msbuddy)
-
-    ft.index = ft.index.astype(str)
-    ft.columns = [str(c) for c in ft.columns]
-    ft.index = ft.index.astype(str)
-
-    # Isolate biological samples from blanks/controls
-    blank_samples = set()
-    if not md.empty:
-        for col in md.columns:
-            try:
-                series_str = md[col].astype(str).str.lower()
-                matches = md.index[series_str.str.contains("blank|control|qc|solvent|media", regex=True)]
-                blank_samples.update(matches.astype(str))
-            except Exception: continue
-    bio_samples_idx = md.index.difference(blank_samples)
-    bio_samples = [c for c in ft.columns if c in bio_samples_idx]
-    if not bio_samples: bio_samples = list(ft.columns)
-
-    # Pre-extract and normalize row IDs
-    f_keys = ft.index.values
-    rids = [str(k).split("_")[0] for k in f_keys]
-    rids = [rid[:-2] if rid.endswith(".0") else rid for rid in rids]
-
-    # Filter for annotated features
-    is_annotated = np.array([rid in annotated_scans for rid in rids])
-    ft_filtered = ft.loc[is_annotated]
-
-    # Calculate mean intensities over biological samples
-    if not ft_filtered.empty and bio_samples:
-        mean_intensities = ft_filtered[bio_samples].mean(axis=1).fillna(0.0).to_dict()
-    else:
-        mean_intensities = {}
-
-    # Gather features with non-zero mean intensities
-    sirius_features = [(f_key, mean_intensities.get(f_key, 0.0)) for f_key in ft_filtered.index]
-
-    # Sort by mean intensity descending and take top 1000
-    sirius_features.sort(key=lambda x: x[1], reverse=True)
-    top_keys = [item[0] for item in sirius_features[:1000]]
-
-    row_id_to_full = {}
-    for k in top_keys:
-        rid = str(k).split("_")[0]
-        if rid.endswith(".0"): rid = rid[:-2]
-        row_id_to_full[rid] = k
-
-    # Pre-filter annotation table for top features
-    an_scans_str = an[scan_col].astype(str).values if scan_col else []
-    normalized_scans = [s[:-2] if s.endswith(".0") else s for s in an_scans_str]
-    unique_row_ids_to_keep = set(row_id_to_full.keys())
-
-    an_keep_mask = np.array([s in unique_row_ids_to_keep for s in normalized_scans])
-    an_subset = an.loc[an_keep_mask]
-
-    # Extract points with COS values
-    points = []
-    name_col = next((c for c in ["Compound_Name", "compound_name", "name", "Name"] if c in an.columns), None)
-
-    for _, row in an_subset.iterrows():
-        rid = str(row[scan_col]) if scan_col else ""
-        if rid.endswith(".0"): rid = rid[:-2]
-        if rid not in row_id_to_full: continue
-
-        # Skip MSBuddy annotations unless requested
-        is_msbuddy = str(row.get("SpectrumID", "")).startswith("MSB_") or str(row.get("Compound_Name", "")).startswith("MSBuddy:")
-        if is_msbuddy and not show_msbuddy:
-            continue
-
-        # Extract formula (formula column → InChI → SMILES)
-        formula, formula_source = _resolve_row_formula(row, formula_col, inchi_col, smiles_col)
-        if not formula:
-            continue
-
-        # Calculate COS
-        cos = calculate_carbon_oxidation_state(formula)
-        if cos is None: continue
-
-        f_key = row_id_to_full[rid]
-        points.append({
-            "metabolite": f_key,
-            "row_id": rid,
-            "formula": formula,
-            "cos": cos,
-            "formula_source": "msbuddy" if is_msbuddy else formula_source,
-            "compound_name": str(row[name_col]) if name_col and not pd.isna(row[name_col]) else "",
-            "intensity": mean_intensities.get(f_key, 1.0),
-            "superclass": str(row.get("superclass", "Unclassified")),
-            "class": str(row.get("class", "Unclassified")),
-            "subclass": str(row.get("subclass", "Unclassified")),
-            "npclassifier_superclass": str(row.get("npclassifier_superclass", "Unclassified")),
-            "npclassifier_class": str(row.get("npclassifier_class", "Unclassified")),
-            "npclassifier_pathway": str(row.get("npclassifier_pathway", "Unclassified"))
+        return json.dumps({
+            "points": points,
+            "total_points": len(points),
+            "total_features": base["total_features"],
+            "annotated_features": base["annotated_features"],
+            "msbuddy_included": bool(show_msbuddy),
         })
 
-    return {
-        "points": points,
-        "total_points": len(points),
-        "total_features": int(ft.shape[0]),
-        "annotated_features": int(is_annotated.sum()),
-        "msbuddy_included": bool(show_msbuddy),
-    }
+    return _json_response(_cached_stats(_stats_key("carbon-ox-state", dataset_dir, bool(show_msbuddy)), compute))
 
 
 @app.get("/api/datasets/{safe_name}/unannotated-count")
-async def get_unannotated_count(safe_name: str):
+def get_unannotated_count(safe_name: str):
     dataset_dir = DATASETS_DIR / safe_name
     if not dataset_dir.exists(): return {"count": 0}
     an_path = dataset_dir / "an.parquet"
     ft_path = dataset_dir / "ft.parquet"
     if not an_path.exists() or not ft_path.exists(): return {"count": 0}
 
-    an = pd.read_parquet(an_path)
-    ft = pd.read_parquet(ft_path)
+    an = _annotation_frame(safe_name, dataset_dir)
+    _, ft = _dataset_frames(safe_name, dataset_dir)
+    if ft is None: ft = pd.read_parquet(ft_path)
 
     scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
     formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
@@ -2119,7 +2392,7 @@ async def get_unannotated_count(safe_name: str):
 
 
 @app.get("/api/datasets/{safe_name}/formula-coverage")
-async def get_formula_coverage(safe_name: str):
+def get_formula_coverage(safe_name: str):
     """Molecular-formula coverage report for a dataset, with guidance on
     improving coverage upstream via SIRIUS + ZODIAC."""
     dataset_dir = DATASETS_DIR / safe_name
@@ -2130,7 +2403,8 @@ async def get_formula_coverage(safe_name: str):
     if not ft_path.exists():
         raise HTTPException(404, "Feature table missing")
 
-    ft = pd.read_parquet(ft_path)
+    _, ft = _dataset_frames(safe_name, dataset_dir)
+    if ft is None: ft = pd.read_parquet(ft_path)
     total_features = int(ft.shape[0])
     ft_rids = set()
     for k in ft.index:
@@ -2142,7 +2416,7 @@ async def get_formula_coverage(safe_name: str):
     annotated_rids: set = set()
 
     if an_path.exists():
-        an = pd.read_parquet(an_path)
+        an = _annotation_frame(safe_name, dataset_dir)
         scan_col = next((c for c in ["#Scan#", "row ID", "row_id"] if c in an.columns), None)
         formula_col = next((c for c in an.columns if c.lower() in ["molecular_formula", "formula"]), None)
         inchi_col = next((c for c in an.columns if c.lower() == "inchi"), None)
@@ -2180,6 +2454,42 @@ async def get_formula_coverage(safe_name: str):
             ],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Statistics dashboard warm-up
+# ---------------------------------------------------------------------------
+
+def _warm_stats_caches(names: Optional[list] = None) -> None:
+    """Precompute each public dataset's default dashboard results (including the
+    Bray-Curtis distance matrix behind PCoA), so the first use of the dashboard is instant."""
+    for dataset_dir in sorted(DATASETS_DIR.iterdir()):
+        if names is not None and dataset_dir.name not in names:
+            continue
+        meta_path = dataset_dir / "meta.json"
+        if not dataset_dir.is_dir() or not meta_path.exists():
+            continue
+        try:
+            if json.loads(meta_path.read_text()).get("hidden"):
+                continue
+            safe = dataset_dir.name
+            get_dataset_metadata_schema(safe)
+            get_dataset_metabolites(safe)
+            get_dataset_vankrevelen(safe)
+            get_dataset_carbon_ox_state(safe)
+            run_map_pcoa({"dataset_safe": safe})
+        except Exception as exc:  # warm-up is best effort; requests compute on demand
+            print(f"Statistics warm-up skipped for {dataset_dir.name}: {exc}")
+
+
+def _start_stats_warmup(names: Optional[list] = None) -> None:
+    threading.Thread(target=_warm_stats_caches, args=(names,), daemon=True).start()
+
+
+@app.on_event("startup")
+async def _warm_stats_on_startup() -> None:
+    if os.environ.get("STATS_WARMUP", "1") != "0":
+        _start_stats_warmup()
 
 
 # ---------------------------------------------------------------------------

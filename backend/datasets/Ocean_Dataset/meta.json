@@ -7,6 +7,8 @@
   "lon_col": "ATTRIBUTE_Longitude",
   "n_samples": 2439,
   "n_features": 15987,
+  "n_samples_on_map": 2314,
+  "n_features_on_map": 15980,
   "has_annotation": true,
   "md_columns": [
     "Owner",
@@ -22,8 +24,8 @@
     "ATTRIBUTE_Depth",
     "ATTRIBUTE_Volume",
     "ATTRIBUTE_SPEcartridge",
-    "ATTRIBUTE_Filtration",
-    "Unnamed: 15"
+    "ATTRIBUTE_Filtration"
   ],
-  "n_md_columns_total": 15
+  "n_md_columns_total": 15,
+  "hidden": true
 }

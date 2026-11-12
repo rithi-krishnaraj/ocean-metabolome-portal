@@ -3,10 +3,6 @@ gnps_client.py
 Fetches FBMN tables from GNPS2 (with GNPS1 fallback) and Everything Bagel (EB)
 tables from GNPS2.
 Mirrors FBMN-STATS-Webapp/src/fileselection.py (load_from_gnps_fbmn).
-
-Files are downloaded directly rather than through gnpsdata: GNPS2 rejects
-Python's default User-Agent with 403, and gnpsdata hides that error by
-returning None, which made every GNPS2 task look like a failed GNPS1 task.
 """
 from __future__ import annotations
 
@@ -19,7 +15,7 @@ from urllib.parse import quote
 import pandas as pd
 import yaml
 
-from data_processor import add_metabolite_index
+from data_processor import add_metabolite_index, read_delimited
 
 DEFAULT_EXAMPLE_TASK_ID = "b661d12ba88745639664988329c1363e"
 
@@ -93,7 +89,7 @@ def _read_remote_table(url: str, sep: str) -> pd.DataFrame:
     request = urllib.request.Request(url, headers=HTTP_HEADERS)
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
         try:
-            return pd.read_csv(response, sep=sep, engine="pyarrow")
+            return read_delimited(response, sep)
         except ValueError:  # pyarrow.ArrowInvalid: malformed rows
             pass
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
@@ -176,9 +172,22 @@ def _read_gnps2_metadata(task_id: str) -> pd.DataFrame:
     return _read_gnps2_first(task_id, GNPS2_EB_METADATA_PATHS, "\t")
 
 
+def normalize_eb_annotations(an: pd.DataFrame) -> pd.DataFrame:
+    """Rename EB library-match columns to their FBMN names (see EB_ANNOTATION_COLUMN_MAP).
+
+    Some libraries fill COMPOUND_NAME instead of NAME, so Compound_Name falls back to it.
+    """
+    renamed = an.rename(columns={k: v for k, v in EB_ANNOTATION_COLUMN_MAP.items() if v not in an.columns})
+    if "COMPOUND_NAME" in renamed.columns:
+        if "Compound_Name" in renamed.columns:
+            renamed["Compound_Name"] = renamed["Compound_Name"].fillna(renamed["COMPOUND_NAME"])
+        else:
+            renamed = renamed.rename(columns={"COMPOUND_NAME": "Compound_Name"})
+    return renamed
+
+
 def _read_eb_annotations(task_id: str) -> pd.DataFrame:
-    an = _read_gnps2_first(task_id, GNPS2_EB_FEATURE_LIBRARY_PATHS, "\t")
-    return an.rename(columns={k: v for k, v in EB_ANNOTATION_COLUMN_MAP.items() if v not in an.columns})
+    return normalize_eb_annotations(_read_gnps2_first(task_id, GNPS2_EB_FEATURE_LIBRARY_PATHS, "\t"))
 
 
 def _read_optional(read, *args) -> Optional[pd.DataFrame]:

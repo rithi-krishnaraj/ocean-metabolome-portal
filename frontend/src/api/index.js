@@ -1,15 +1,14 @@
 const BASE = '/api'
-const TOKEN_KEY = 'adminToken'
+// Admin token from /admin/login, kept in memory only: every page load or refresh
+// starts with the admin page locked. It survives switching pages within the portal.
+let adminToken = null
 
-// Admin token from /admin/login, kept for this browser tab only.
-export const getAdminToken = () => {
-  try { return sessionStorage.getItem(TOKEN_KEY) } catch { return null }
-}
+export const getAdminToken = () => adminToken
 export const clearAdminToken = () => {
-  try { sessionStorage.removeItem(TOKEN_KEY) } catch { /* storage unavailable */ }
+  adminToken = null
 }
 const setAdminToken = (token) => {
-  try { sessionStorage.setItem(TOKEN_KEY, token) } catch { /* storage unavailable */ }
+  adminToken = token
 }
 
 async function req(method, path, body) {
@@ -67,7 +66,9 @@ export const getMapSampleDetails = (datasetSafe, lat, lon, sampleId) => {
 export const getMetaboliteFeatureMatches = (body) => req('POST', '/map/metabolite-features', body)
 export const getDatasetMetadataSchema = (safeName) => req('GET', `/datasets/${safeName}/metadata-schema`)
 export const getDatasetMetabolites = (safeName) => req('GET', `/datasets/${safeName}/metabolites`)
-export const getBoxplotData = (safeName, metabolite, samples) => req('POST', `/datasets/${safeName}/boxplot-data`, { metabolite, samples })
+// Sample metadata is left out: the dashboard already has it from getDatasetMetadataSchema
+export const getBoxplotData = (safeName, metabolite, samples) =>
+  req('POST', `/datasets/${safeName}/boxplot-data`, { metabolite, samples, include_metadata: false })
 export const runMapPcoa = (body) => req('POST', '/map/pcoa', body)
 export const getVanKrevelenData = (safeName, showMsbuddy = false) =>
   req('GET', `/datasets/${safeName}/vankrevelen${showMsbuddy ? '?show_msbuddy=true' : ''}`)

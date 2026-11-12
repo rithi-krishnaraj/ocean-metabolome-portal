@@ -18,6 +18,8 @@ import {
   X,
   Trash2,
   Pencil,
+  Eye,
+  EyeOff,
   AlertTriangle,
   Save,
   RefreshCw,
@@ -141,12 +143,18 @@ export default function AdminPage() {
     setError('')
     setLoading(true)
     try {
-      await saveDataset({
+      const saved = await saveDataset({
         session_id: session.session_id,
         name: datasetName.trim(),
         visible_md_columns: (session.md_columns ?? []).filter((c) => visibleMdColumns.has(c)),
       })
-      setSuccessMsg(`Dataset "${datasetName}" saved successfully!`)
+      const fmt = (n) => (n ?? 0).toLocaleString()
+      setSuccessMsg(
+        `Dataset "${datasetName}" saved successfully! ` +
+        `${fmt(saved.n_samples_on_map)} of ${fmt(saved.n_samples)} samples and ` +
+        `${fmt(saved.n_features_on_map)} of ${fmt(saved.n_features)} features have latitude/longitude ` +
+        `and are included on the map.`
+      )
       setSession(null)
       setStep(0)
       setFtFile(null); setMdFile(null); setAnFile(null)
@@ -163,6 +171,16 @@ export default function AdminPage() {
     if (!window.confirm(`Delete dataset "${safeName}"?`)) return
     try {
       await deleteDataset(safeName)
+    } catch (e) {
+      setError(e.message)
+    }
+    refreshLibrary()
+  }
+
+  const handleToggleHidden = async (ds) => {
+    try {
+      await updateDataset(ds.safe_name, { hidden: !ds.hidden })
+      setSuccessMsg(`Dataset "${ds.name}" is now ${ds.hidden ? 'shown on' : 'hidden from'} the map.`)
     } catch (e) {
       setError(e.message)
     }
@@ -261,10 +279,10 @@ export default function AdminPage() {
                     <label className="text-xs text-slate-400 font-medium">Feature Quantification Table *</label>
                     <FileDrop
                       label="Drag or click to upload"
-                      accept=".csv,.tsv,.txt,.xlsx"
+                      accept=".csv,.tsv,.txt,.xlsx,.parquet"
                       onFile={setFtFile}
                       file={ftFile}
-                      hint="csv, tsv, txt, xlsx"
+                      hint="csv, tsv, txt, xlsx, parquet"
                     />
                   </div>
                   <div className="space-y-1">
@@ -280,7 +298,7 @@ export default function AdminPage() {
                   <label className="text-xs text-slate-400 font-medium">Annotation Table (optional)</label>
                   <FileDrop
                     label="Drag or click to upload annotation table"
-                    accept=".csv,.tsv,.txt,.xlsx"
+                    accept=".csv,.tsv,.txt,.xlsx,.parquet"
                     onFile={setAnFile}
                     file={anFile}
                     hint="optional"
@@ -380,11 +398,14 @@ export default function AdminPage() {
               <span>FT: {session.ft_shape?.[0]} features × {session.ft_shape?.[1]} samples</span>
               <span>MD: {session.md_shape?.[0]} samples × {session.md_shape?.[1]} columns</span>
               {session.an_shape?.[0] > 0 && <span>AN: {session.an_shape?.[0]} rows</span>}
+              {session.n_unknown_ecosystem_removed > 0 && (
+                <span>Removed {session.n_unknown_ecosystem_removed} samples with Unknown ATTRIBUTE_Ecosystem</span>
+              )}
             </div>
             {session.preview_max_cols && (
               <p className="text-xs text-slate-500">
                 Preview shows up to the first {session.preview_max_rows} rows and {session.preview_max_cols} columns
-                of each table (all columns for Metadata); the full tables are saved.
+                of each table; the full tables are saved.
               </p>
             )}
 
@@ -402,7 +423,13 @@ export default function AdminPage() {
               ))}
             </div>
 
-            <DataTable data={tableData(activeTab)} pageSize={10} />
+            {/* All tables stay mounted and inactive ones are hidden, so switching tabs
+                doesn't rebuild the (thousands of columns wide) feature table. */}
+            {['ft', 'md', 'an', 'combined'].map((t) => (
+              <div key={t} className={activeTab === t ? '' : 'hidden'}>
+                <DataTable data={tableData(t)} pageSize={10} />
+              </div>
+            ))}
 
             <div className="flex gap-3">
               <button onClick={() => setStep(2)} className="px-5 py-2 bg-ocean-600 hover:bg-ocean-500 text-white text-sm rounded-lg font-medium">
@@ -511,7 +538,10 @@ export default function AdminPage() {
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
               {datasets.map((ds) => (
-                <div key={ds.safe_name} className="bg-slate-800 border border-slate-700 rounded-lg p-4 space-y-2">
+                <div
+                  key={ds.safe_name}
+                  className={`bg-slate-800 border border-slate-700 rounded-lg p-4 space-y-2 ${ds.hidden ? 'opacity-60' : ''}`}
+                >
                   <div className="flex items-start justify-between">
                     <h3 className="font-semibold text-slate-200 text-sm">{ds.name}</h3>
                     <div className="flex">
@@ -521,6 +551,13 @@ export default function AdminPage() {
                         title="Edit name and public metadata"
                       >
                         <Pencil size={14} />
+                      </button>
+                      <button
+                        onClick={() => handleToggleHidden(ds)}
+                        className="text-slate-400 hover:text-slate-200 p-1"
+                        title={ds.hidden ? 'Show dataset on the map' : 'Hide dataset from the map'}
+                      >
+                        {ds.hidden ? <EyeOff size={14} /> : <Eye size={14} />}
                       </button>
                       <button
                         onClick={() => handleDelete(ds.safe_name)}
@@ -543,6 +580,7 @@ export default function AdminPage() {
                     />
                   )}
                   <div className="text-xs text-slate-400 space-y-0.5">
+                    {ds.hidden && <p className="text-yellow-500">Hidden from map</p>}
                     <p>{ds.n_samples} samples · {ds.n_features} features</p>
                     <p className={ds.has_coords ? 'text-green-400' : 'text-yellow-500'}>
                       {ds.has_coords ? `📍 ${ds.lat_col} / ${ds.lon_col}` : '⚠ No coordinates'}

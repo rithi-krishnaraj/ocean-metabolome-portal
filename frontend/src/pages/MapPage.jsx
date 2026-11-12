@@ -4,6 +4,7 @@ import { ScatterplotLayer } from '@deck.gl/layers'
 import MapLibreMap from 'react-map-gl/maplibre'
 import maplibregl from 'maplibre-gl'
 import StatsPanel from '../components/StatsPanel'
+import WelcomeTour from '../components/WelcomeTour'
 import Plotly from 'plotly.js-dist-min'
 import createPlotlyComponent from 'react-plotly.js/factory'
 import { 
@@ -240,6 +241,16 @@ function getIntensityScaleValue(intensity, scale) {
   return num
 }
 
+// A point's scaled intensity for the metabolite shown on the map; -Infinity when not detected.
+function pointIntensity(p, intensityInfo, mapData) {
+  const key = getPointSampleKey(p, mapData?.dataset_safe_map)
+  const scaled = key ? intensityInfo?.byKey.get(key) : undefined
+  return typeof scaled === 'number' ? scaled : -Infinity
+}
+
+// Sort comparator that also orders -Infinity (x - y would give NaN for two of them)
+const compareNumbers = (x, y) => (x === y ? 0 : x < y ? -1 : 1)
+
 function getPointSampleKey(p, datasetSafeMap) {
   const sampleId = String(p._sample_id || p.index || p.filename || '').trim()
   const datasetSafe = String(
@@ -271,6 +282,7 @@ export default function MapPage({
   onColorByChange = () => {},
   onColorOptionsChange = () => {},
   resetTrigger = 0,
+  tourRestart = 0,
 }) {
   const [mapData, setMapData] = useState(null)
   const [mapStyle, setMapStyle] = useState(BASEMAP.englishLabels ? null : BASEMAP.style)
@@ -413,6 +425,29 @@ export default function MapPage({
     return groups
   }, [pcoaAllSamples, pcoaAttribute])
 
+  // Set views of the sample selections: the sample checklists test membership for every row on each render
+  const pcoaSampleSet = useMemo(() => new Set(pcoaSamples), [pcoaSamples])
+  const boxplotSampleSet = useMemo(() => new Set(boxplotSamples), [boxplotSamples])
+  const boxplotSampleById = useMemo(() => new Map(boxplotAllSamples.map((s) => [s.sample_id, s])), [boxplotAllSamples])
+
+  // Dashboard data is fetched once per dataset (and option) and reused, so switching
+  // datasets or options back and forth answers at once instead of refetching.
+  const statsCacheRef = useRef(new Map())
+  const cachedStats = useCallback((key, fetcher) => {
+    const cache = statsCacheRef.current
+    if (!cache.has(key)) {
+      cache.set(key, fetcher().catch((err) => {
+        cache.delete(key)
+        throw err
+      }))
+    }
+    return cache.get(key)
+  }, [])
+  const loadMetadataSchema = useCallback(
+    (safe) => cachedStats(`schema|${safe}`, () => getDatasetMetadataSchema(safe)),
+    [cachedStats],
+  )
+
   const toggleCategorySelection = (cat, isChecked) => {
     let nextCategories
     let nextSamples = new Set(pcoaSamples)
@@ -500,9 +535,8 @@ export default function MapPage({
       setPcoaAllCategories([])
       return
     }
-    setPcoaLoading(true)
     try {
-      const data = await getDatasetMetadataSchema(pcoaDatasetSafe)
+      const data = await loadMetadataSchema(pcoaDatasetSafe)
       if (data?.categories?.[newAttr]) {
         const allCats = data.categories[newAttr]
         setPcoaAllCategories(allCats)
@@ -520,8 +554,6 @@ export default function MapPage({
       }
     } catch (err) {
       console.error(err)
-    } finally {
-      setPcoaLoading(false)
     }
   }
 
@@ -540,7 +572,7 @@ export default function MapPage({
         setPcoaResult(null)
         setPcoaError('')
         try {
-          const data = await getDatasetMetadataSchema(pcoaDatasetSafe)
+          const data = await loadMetadataSchema(pcoaDatasetSafe)
           if (data?.columns?.length > 0) {
             setPcoaMetadataColumns(data.columns)
             const defaultAttr = data.columns[0]
@@ -581,8 +613,8 @@ export default function MapPage({
         setBoxplotError('')
         try {
           const [metas, schema] = await Promise.all([
-            getDatasetMetabolites(boxplotDatasetSafe),
-            getDatasetMetadataSchema(boxplotDatasetSafe)
+            cachedStats(`metabolites|${boxplotDatasetSafe}`, () => getDatasetMetabolites(boxplotDatasetSafe)),
+            loadMetadataSchema(boxplotDatasetSafe)
           ])
           setBoxplotAllMetabolites(metas.metabolites || [])
           const samples = schema.samples || []
@@ -627,11 +659,11 @@ export default function MapPage({
     })
   }
 
-  // Clear boxplot results when filters change
+  // Clear boxplot results when filters change (a new grouping just regroups the current result)
   useEffect(() => {
     setBoxplotResult(null)
     setBoxplotError('')
-  }, [boxplotDatasetSafe, boxplotMetabolite, boxplotSamples, boxplotGroupBy])
+  }, [boxplotDatasetSafe, boxplotMetabolite, boxplotSamples])
 
   // Van Krevelen Defaults & Data Fetching
   useEffect(() => {
@@ -645,7 +677,10 @@ export default function MapPage({
     setVankrevelenLoading(true)
     setVankrevelenError('')
     try {
-      const data = await getVanKrevelenData(vankrevelenDatasetSafe, vankrevelenShowMsbuddy)
+      const data = await cachedStats(
+        `vankrevelen|${vankrevelenDatasetSafe}|${vankrevelenShowMsbuddy}`,
+        () => getVanKrevelenData(vankrevelenDatasetSafe, vankrevelenShowMsbuddy),
+      )
       setVankrevelenResult(data)
     } catch (err) {
       setVankrevelenError(err.message || 'Failed to fetch Van Krevelen data.')
@@ -653,7 +688,7 @@ export default function MapPage({
     } finally {
       setVankrevelenLoading(false)
     }
-  }, [vankrevelenDatasetSafe, vankrevelenShowMsbuddy])
+  }, [vankrevelenDatasetSafe, vankrevelenShowMsbuddy, cachedStats])
 
   // Clear stale result when dataset changes
   useEffect(() => {
@@ -687,7 +722,10 @@ export default function MapPage({
     setCarbonOxStateLoading(true)
     setCarbonOxStateError('')
     try {
-      const data = await getCarbonOxStateData(carbonOxStateDatasetSafe, carbonOxStateShowMsbuddy)
+      const data = await cachedStats(
+        `carbon-ox-state|${carbonOxStateDatasetSafe}|${carbonOxStateShowMsbuddy}`,
+        () => getCarbonOxStateData(carbonOxStateDatasetSafe, carbonOxStateShowMsbuddy),
+      )
       setCarbonOxStateResult(data)
     } catch (err) {
       setCarbonOxStateError(err.message || 'Failed to fetch Carbon Oxidation State data.')
@@ -695,7 +733,7 @@ export default function MapPage({
     } finally {
       setCarbonOxStateLoading(false)
     }
-  }, [carbonOxStateDatasetSafe, carbonOxStateShowMsbuddy])
+  }, [carbonOxStateDatasetSafe, carbonOxStateShowMsbuddy, cachedStats])
 
   // Clear stale result when dataset changes
   useEffect(() => {
@@ -720,6 +758,7 @@ export default function MapPage({
   const load = useCallback(async () => {
     setLoading(true)
     setError('')
+    statsCacheRef.current.clear()
     try {
       const data = await getMapData()
       setMapData(data)
@@ -878,35 +917,37 @@ export default function MapPage({
     return out
   }, [mapData, datasetScopedPoints, allowedColumns])
 
-  // Filtered points — apply active metadata filters
-  const points = useMemo(() => {
+  // Whether any sample filter (metadata categories or hand-picked samples) is active
+  const sampleFiltersActive = useMemo(
+    () => selectedSamples.size > 0
+      || Object.entries(filters).some(([col, included]) => allowedColumns.includes(col) && included.size > 0),
+    [filters, allowedColumns, selectedSamples],
+  )
+
+  // Points passing the sample filters (metadata categories and selected samples)
+  const sampleFilteredPoints = useMemo(() => {
     if (!datasetScopedPoints.length) return []
     return datasetScopedPoints.filter((p) => {
       for (const [col, included] of Object.entries(filters)) {
         if (!allowedColumns.includes(col)) continue
         if (included.size > 0 && !included.has(String(p[col] ?? 'N/A'))) return false
       }
-
-      const sampleId = String(p._sample_id || p.index || p.filename || '').trim()
-      const datasetSafe = String(
-        p._dataset_safe
-        || mapData?.dataset_safe_map?.[String(p._dataset ?? '')]
-        || ''
-      ).trim()
-      const sampleKey = `${datasetSafe}::${sampleId}`
-
-      if (selectedSamples.size > 0 && !selectedSamples.has(sampleKey)) {
-        return false
+      if (selectedSamples.size > 0) {
+        const sampleKey = getPointSampleKey(p, mapData?.dataset_safe_map)
+        if (!sampleKey || !selectedSamples.has(sampleKey)) return false
       }
-
-      if (metaboliteSampleKeys.size > 0) {
-        if (!datasetSafe || !sampleId) return false
-        if (!metaboliteSampleKeys.has(sampleKey)) return false
-      }
-
       return true
     })
-  }, [datasetScopedPoints, filters, allowedColumns, selectedSamples, metaboliteSampleKeys, mapData])
+  }, [datasetScopedPoints, filters, allowedColumns, selectedSamples, mapData])
+
+  // Filtered points — sample filters, then the metabolite applied to the map
+  const points = useMemo(() => {
+    if (metaboliteSampleKeys.size === 0) return sampleFilteredPoints
+    return sampleFilteredPoints.filter((p) => {
+      const sampleKey = getPointSampleKey(p, mapData?.dataset_safe_map)
+      return !!sampleKey && metaboliteSampleKeys.has(sampleKey)
+    })
+  }, [sampleFilteredPoints, metaboliteSampleKeys, mapData])
 
   const visiblePointKeys = useMemo(() => {
     const set = new globalThis.Set()
@@ -982,9 +1023,14 @@ export default function MapPage({
   const layer = useMemo(() => {
     if (!points.length) return null
     const intensityActive = !!intensityInfo
+    // Deck.gl draws in data order, so sort by intensity: where samples share a location,
+    // the most intense one is drawn (and picked) on top; undetected (grey) ones go below.
+    const data = intensityActive
+      ? [...points].sort((a, b) => compareNumbers(pointIntensity(a, intensityInfo, mapData), pointIntensity(b, intensityInfo, mapData)))
+      : points
     return new ScatterplotLayer({
       id: 'metabolome-points',
-      data: points,
+      data,
       getPosition: (d) => [parseFloat(d._lon), parseFloat(d._lat)],
       getColor: (d) => {
         if (intensityActive) {
@@ -1195,8 +1241,12 @@ export default function MapPage({
     const lon = String(hoverPoint._lon)
     return points
       .filter((p) => String(p._lat) === lat && String(p._lon) === lon)
-      .sort((a, b) => resolveSampleId(a).localeCompare(resolveSampleId(b)))
-  }, [hoverPoint, points, resolveSampleId])
+      .sort((a, b) => intensityInfo
+        // With a metabolite on the map, most intense first (the one drawn on top)
+        ? compareNumbers(pointIntensity(b, intensityInfo, mapData), pointIntensity(a, intensityInfo, mapData))
+          || resolveSampleId(a).localeCompare(resolveSampleId(b))
+        : resolveSampleId(a).localeCompare(resolveSampleId(b)))
+  }, [hoverPoint, points, resolveSampleId, intensityInfo, mapData])
 
   const selectColocatedSample = (sampleKey) => {
     const next = colocatedPoints.find((p) => getPointSampleKey(p, mapData?.dataset_safe_map) === sampleKey)
@@ -1211,9 +1261,21 @@ export default function MapPage({
     setMetaboliteMatchesError('')
     try {
       const datasetSafes = [...datasetFilter].map((datasetName) => String(mapData?.dataset_safe_map?.[datasetName] ?? '')).filter(Boolean)
+      // With sample filters active, only detections in the samples they keep count.
+      let sampleKeys
+      if (sampleFiltersActive) {
+        sampleKeys = {}
+        for (const p of sampleFilteredPoints) {
+          const key = getPointSampleKey(p, mapData?.dataset_safe_map)
+          if (!key) continue
+          const sep = key.indexOf('::')
+          ;(sampleKeys[key.slice(0, sep)] ??= []).push(key.slice(sep + 2))
+        }
+      }
       const data = await getMetaboliteFeatureMatches({
         ...metaboliteQuery,
         dataset_safes: datasetSafes,
+        sample_keys: sampleKeys,
         limit: 500,
       })
       setMetaboliteMatches(data?.features ?? [])
@@ -1377,7 +1439,7 @@ export default function MapPage({
             <div className="max-h-64 overflow-y-auto border border-slate-800 rounded bg-slate-950/40 space-y-2 p-1">
               {Object.keys(samplesByGroup).sort().map(groupName => {
                 const groupSamples = samplesByGroup[groupName]
-                const selectedInGroup = groupSamples.filter(s => boxplotSamples.includes(s.sample_id))
+                const selectedInGroup = groupSamples.filter(s => boxplotSampleSet.has(s.sample_id))
                 const isAllChecked = selectedInGroup.length === groupSamples.length
                 const isPartial = selectedInGroup.length > 0 && selectedInGroup.length < groupSamples.length
                 const isExpanded = !!boxplotExpandedGroups[groupName]
@@ -1413,12 +1475,12 @@ export default function MapPage({
                           <label
                             key={s.sample_id}
                             className={`flex items-center gap-2 px-1.5 py-0.5 text-[9px] cursor-pointer rounded hover:bg-slate-800/40 ${
-                              boxplotSamples.includes(s.sample_id) ? 'text-ocean-300' : 'text-slate-500'
+                              boxplotSampleSet.has(s.sample_id) ? 'text-ocean-300' : 'text-slate-500'
                             }`}
                           >
                             <input
                               type="checkbox"
-                              checked={boxplotSamples.includes(s.sample_id)}
+                              checked={boxplotSampleSet.has(s.sample_id)}
                               onChange={() => toggleBoxplotSample(s.sample_id)}
                               className="rounded scale-75 accent-ocean-500"
                             />
@@ -1464,7 +1526,7 @@ export default function MapPage({
                 Intensity Comparison: {boxplotMetabolite} {boxplotGroupBy ? `grouped by ${boxplotGroupBy}` : ''}
               </h4>
               <CachedPlot
-                deps={[boxplotResult, boxplotGroupBy, boxplotMetabolite]}
+                deps={[boxplotResult, boxplotGroupBy, boxplotMetabolite, boxplotSampleById]}
                 data={(() => {
                   if (!boxplotGroupBy) {
                     return [{
@@ -1483,7 +1545,7 @@ export default function MapPage({
                   // Group data by the selected metadata category
                   const groups = {}
                   boxplotResult.data.forEach(d => {
-                    const val = d.metadata[boxplotGroupBy] || 'N/A'
+                    const val = boxplotSampleById.get(d.sample_id)?.[boxplotGroupBy] || 'N/A'
                     if (!groups[val]) groups[val] = []
                     groups[val].push(d.intensity)
                   })
@@ -2316,6 +2378,8 @@ export default function MapPage({
         {mapStyle && <MapLibreMap mapStyle={mapStyle} />}
       </DeckGL>
 
+      <WelcomeTour loading={loading} restartSignal={tourRestart} />
+
       {/* Loading overlay */}
       {(loading || colorBy !== appliedColorBy) && (
         <div className="absolute inset-0 flex items-center justify-center bg-slate-900/60 z-10">
@@ -2350,7 +2414,7 @@ export default function MapPage({
 
       {/* Stats panel */}
       {mapData && (
-        <div className="absolute top-3 left-3 z-10 flex flex-col gap-2">
+        <div className="absolute top-3 left-3 z-10 flex flex-col gap-2" data-tour="map-summary">
           <StatsPanel
             datasets={mapData.datasets_details || mapData.datasets || []}
             visibleDatasets={filteredStats.datasets}
@@ -2364,18 +2428,21 @@ export default function MapPage({
       <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
         <button
           onClick={() => setAnalysisOpen((o) => !o)}
+          data-tour="stats-dashboard"
           className="bg-slate-800/90 border border-slate-700 rounded-lg px-3 py-2 flex items-center gap-2 text-sm text-slate-300 hover:text-slate-100 hover:bg-slate-700/90"
         >
           <BarChart3 size={14} /> Statistical Analysis
         </button>
         <button
           onClick={() => setMetaboliteFilterOpen((o) => !o)}
+          data-tour="metabolite-filter"
           className="bg-slate-800/90 border border-slate-700 rounded-lg px-3 py-2 flex items-center gap-2 text-sm text-slate-300 hover:text-slate-100 hover:bg-slate-700/90"
         >
           <Filter size={14} /> Metabolite Filtering
         </button>
         <button
           onClick={() => setFilterOpen((o) => !o)}
+          data-tour="sample-filter"
           className="bg-slate-800/90 border border-slate-700 rounded-lg px-3 py-2 flex items-center gap-2 text-sm text-slate-300 hover:text-slate-100 hover:bg-slate-700/90"
         >
           <Filter size={14} /> Sample Filtering
@@ -2505,7 +2572,7 @@ export default function MapPage({
                     <div className="max-h-60 overflow-y-auto border border-slate-800 rounded bg-slate-950/40 p-1.5 space-y-2">
                       {(pcoaAllCategories || []).map((cat) => {
                         const samplesInCat = pcoaSamplesByGroup[cat] || []
-                        const selectedSamplesInCat = samplesInCat.filter(s => pcoaSamples.includes(s.sample_id))
+                        const selectedSamplesInCat = samplesInCat.filter(s => pcoaSampleSet.has(s.sample_id))
                         const isCatChecked = pcoaCategories.includes(cat)
                         const isExpanded = !!expandedGroups[cat]
                         const searchVal = sampleGroupSearch[cat] || ""
@@ -2572,7 +2639,7 @@ export default function MapPage({
                                     <span className="text-[10px] text-slate-500 italic block py-0.5">No matching samples</span>
                                   ) : (
                                     filteredSamples.map((sample) => {
-                                      const isSampleChecked = pcoaSamples.includes(sample.sample_id)
+                                      const isSampleChecked = pcoaSampleSet.has(sample.sample_id)
                                       return (
                                         <label key={sample.sample_id} className="flex items-center gap-1.5 text-[10px] text-slate-300 cursor-pointer select-none hover:bg-slate-800/20 py-0.5 px-1 rounded truncate">
                                           <input

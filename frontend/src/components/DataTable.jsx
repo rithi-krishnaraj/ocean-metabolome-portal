@@ -36,40 +36,43 @@ export default memo(function DataTable({ data = [], pageSize = 10 }) {
     return <p className="text-slate-500 text-sm py-4 text-center">No data to display.</p>
 
   return (
-    <div className="overflow-x-auto rounded-lg border border-slate-700">
-      <table className="w-full text-xs border-collapse">
-        <thead className="bg-slate-700 sticky top-0">
-          {table.getHeaderGroups().map((hg) => (
-            <tr key={hg.id}>
-              {hg.headers.map((h) => (
-                <th
-                  key={h.id}
-                  className="px-3 py-2 text-left font-medium text-slate-300 whitespace-nowrap border-b border-slate-600"
-                >
-                  {flexRender(h.column.columnDef.header, h.getContext())}
-                </th>
-              ))}
-            </tr>
-          ))}
-        </thead>
-        <tbody>
-          {table.getRowModel().rows.map((row, i) => (
-            <tr
-              key={row.id}
-              className={i % 2 === 0 ? 'bg-slate-800' : 'bg-slate-800/60'}
-            >
-              {row.getVisibleCells().map((cell) => (
-                <td
-                  key={cell.id}
-                  className="px-3 py-1.5 text-slate-300 border-b border-slate-700/50 max-w-48 overflow-hidden text-ellipsis whitespace-nowrap"
-                >
-                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="rounded-lg border border-slate-700 overflow-hidden">
+      {/* Only the table scrolls sideways, so the pagination stays in view */}
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs border-collapse">
+          <thead className="bg-slate-700 sticky top-0">
+            {table.getHeaderGroups().map((hg) => (
+              <tr key={hg.id}>
+                {hg.headers.map((h) => (
+                  <th
+                    key={h.id}
+                    className="px-3 py-2 text-left font-medium text-slate-300 whitespace-nowrap border-b border-slate-600"
+                  >
+                    {flexRender(h.column.columnDef.header, h.getContext())}
+                  </th>
+                ))}
+              </tr>
+            ))}
+          </thead>
+          <tbody>
+            {table.getRowModel().rows.map((row, i) => (
+              <tr
+                key={row.id}
+                className={i % 2 === 0 ? 'bg-slate-800' : 'bg-slate-800/60'}
+              >
+                {row.getVisibleCells().map((cell) => (
+                  <td
+                    key={cell.id}
+                    className="px-3 py-1.5 text-slate-300 border-b border-slate-700/50 max-w-48 overflow-hidden text-ellipsis whitespace-nowrap"
+                  >
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
       {/* Pagination */}
       <div className="flex items-center justify-between px-3 py-2 bg-slate-800 border-t border-slate-700">

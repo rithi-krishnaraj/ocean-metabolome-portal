@@ -66,8 +66,8 @@ export function MetadataUploader({ onFile, file, onValidationChange = () => {} }
   const handle = (f) => {
     setWarning('')
 
-    // Let backend validate XLSX content; client-side header parse is CSV/TSV/TXT only.
-    if (f.name.toLowerCase().endsWith('.xlsx')) {
+    // Let backend validate XLSX/Parquet content; client-side header parse is CSV/TSV/TXT only.
+    if (/\.(xlsx|parquet)$/i.test(f.name)) {
       onValidationChange(true)
       onFile(f)
       return
@@ -117,7 +117,7 @@ export function MetadataUploader({ onFile, file, onValidationChange = () => {} }
     <div className="space-y-2">
       <FileDrop
         label="Meta Data Table"
-        accept=".csv,.tsv,.txt,.xlsx"
+        accept=".csv,.tsv,.txt,.xlsx,.parquet"
         onFile={handle}
         file={file}
         hint="Must include Latitude & Longitude columns for map display"

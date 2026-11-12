@@ -45,3 +45,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 .DS_Store
+
+# Cached statistics (PCoA distance matrices), rebuilt automatically
+backend/datasets/*/.cache/
